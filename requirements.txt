@@ -1,0 +1,20 @@
+# FastAPI Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# Web Scraping
+playwright==1.40.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+tldextract==5.1.1
+
+# Database
+supabase==2.3.0
+
+# HTTP & Async
+httpx==0.25.2
+aiohttp==3.9.1
+
+# Utilities
+python-dotenv==1.0.0

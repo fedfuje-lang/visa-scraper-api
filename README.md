@@ -4,6 +4,7 @@ FastAPI Service für URL Discovery - deployed auf Railway.app
 
 ## 📋 Was macht dieser Service?
 
+
 Dieser API-Service:
 1. ✅ Liest aktive Rules aus Supabase `config_rules`
 2. ✅ Crawlt Webseiten mit Playwright + BeautifulSoup

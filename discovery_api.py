@@ -208,6 +208,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     discovered_urls = []
     
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
+    logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -335,6 +336,8 @@ def update_last_crawled(rule_id: str):
 class DiscoveryRequest(BaseModel):
     trigger: str = "manual"
     rule_ids: Optional[List[str]] = None
+    filter: Optional[Dict[str, str]] = None
+    max_urls: Optional[int] = None
 
 class DiscoveryResponse(BaseModel):
     success: bool
@@ -368,10 +371,16 @@ async def run_discovery(request: DiscoveryRequest):
     """
     Main endpoint: Runs URL discovery for all active rules
     Called by n8n HTTP Request Node
+    
+    Supports:
+    - rule_ids: List of specific rule IDs to process
+    - filter: Dict with country_iso and/or target_group
+    - max_urls: Override max_urls from config_rules
     """
     
     logger.info("="*80)
     logger.info("🚀 DISCOVERY API STARTED")
+    logger.info(f"📋 Request: {request.dict()}")
     logger.info("="*80)
     
     try:
@@ -381,12 +390,22 @@ async def run_discovery(request: DiscoveryRequest):
         # Filter by rule_ids if provided
         if request.rule_ids:
             query = query.in_("rule_id", request.rule_ids)
+            logger.info(f"🔍 Filtering by rule_ids: {request.rule_ids}")
+        
+        # Filter by country_iso and/or target_group if provided
+        if request.filter:
+            if "country_iso" in request.filter:
+                query = query.eq("country_iso", request.filter["country_iso"])
+                logger.info(f"🔍 Filtering by country_iso: {request.filter['country_iso']}")
+            if "target_group" in request.filter:
+                query = query.eq("target_group", request.filter["target_group"])
+                logger.info(f"🔍 Filtering by target_group: {request.filter['target_group']}")
         
         response = query.execute()
         rules = response.data
         
         if not rules:
-            logger.warning("⚠️ No active rules found")
+            logger.warning("⚠️ No active rules found matching criteria")
             return DiscoveryResponse(
                 success=False,
                 total_rules_processed=0,
@@ -405,9 +424,16 @@ async def run_discovery(request: DiscoveryRequest):
         for i, rule in enumerate(rules, 1):
             logger.info(f"\n{'='*80}")
             logger.info(f"📍 Rule {i}/{len(rules)}: {rule['rule_id']}")
+            logger.info(f"🌍 Country: {rule['country_name']}")
+            logger.info(f"📂 Group: {rule['target_group']}")
             logger.info(f"{'='*80}")
             
             try:
+                # Override max_urls if provided in request
+                if request.max_urls:
+                    rule['max_urls'] = request.max_urls
+                    logger.info(f"🔧 Overriding max_urls to {request.max_urls}")
+                
                 discovered_urls = await discover_urls(rule)
                 saved_count = save_urls_to_supabase(discovered_urls)
                 update_last_crawled(rule['rule_id'])
@@ -416,6 +442,7 @@ async def run_discovery(request: DiscoveryRequest):
                 results_per_rule.append({
                     "rule_id": rule['rule_id'],
                     "country": rule['country_name'],
+                    "target_group": rule['target_group'],
                     "urls_found": saved_count,
                     "success": True
                 })
@@ -425,6 +452,7 @@ async def run_discovery(request: DiscoveryRequest):
                 results_per_rule.append({
                     "rule_id": rule['rule_id'],
                     "country": rule['country_name'],
+                    "target_group": rule.get('target_group', 'unknown'),
                     "urls_found": 0,
                     "success": False,
                     "error": str(e)
@@ -432,6 +460,7 @@ async def run_discovery(request: DiscoveryRequest):
         
         logger.info(f"\n{'='*80}")
         logger.info("✅ DISCOVERY API COMPLETED")
+        logger.info(f"📊 Total URLs found: {total_urls_found}")
         logger.info(f"{'='*80}")
         
         return DiscoveryResponse(

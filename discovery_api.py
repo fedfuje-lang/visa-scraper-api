@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="1.0.0"
+    version="1.1.0"
 )
 
 # CORS Middleware (für n8n)
@@ -339,6 +339,19 @@ class DiscoveryRequest(BaseModel):
     filter: Optional[Dict[str, str]] = None
     max_urls: Optional[int] = None
 
+class DirectDiscoveryRequest(BaseModel):
+    """
+    NEW: Direct discovery request for n8n Workflow 1
+    Accepts start_urls directly without Supabase config_rules
+    """
+    start_urls: List[str]
+    country_code: str
+    country_name: str
+    target_group: str
+    rule_id: str
+    max_depth: int = 3
+    max_urls: int = 100
+
 class DiscoveryResponse(BaseModel):
     success: bool
     total_rules_processed: int
@@ -347,14 +360,20 @@ class DiscoveryResponse(BaseModel):
     failed_rules: int
     results_per_rule: List[Dict]
 
+class DirectDiscoveryResponse(BaseModel):
+    success: bool
+    total_urls_found: int
+    urls: List[Dict]
+
 @app.get("/")
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "running",
         "endpoints": {
-            "discover": "/discover",
+            "discover": "/discover (uses config_rules from Supabase)",
+            "discover-direct": "/discover-direct (direct URLs from n8n)",
             "health": "/health"
         }
     }
@@ -366,11 +385,86 @@ async def health():
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
+@app.post("/discover-direct", response_model=DirectDiscoveryResponse)
+async def discover_direct(request: DirectDiscoveryRequest):
+    """
+    NEW ENDPOINT FOR N8N WORKFLOW 1
+    
+    Accepts start_urls directly (no Supabase config_rules needed)
+    Crawls all start_urls, combines results, saves to discovered_urls
+    Returns URLs for n8n logging/debugging
+    
+    Usage:
+    POST /discover-direct
+    {
+        "start_urls": ["https://...", "https://..."],
+        "country_code": "US",
+        "country_name": "United States",
+        "target_group": "GROUP A: VISA & RECHT",
+        "rule_id": "US-VISA-A",
+        "max_depth": 3,
+        "max_urls": 100
+    }
+    """
+    
+    logger.info("="*80)
+    logger.info("🚀 DIRECT DISCOVERY STARTED")
+    logger.info(f"📋 Country: {request.country_name} ({request.country_code})")
+    logger.info(f"📂 Group: {request.target_group}")
+    logger.info(f"🔗 Start URLs: {len(request.start_urls)}")
+    logger.info("="*80)
+    
+    discovered_urls = []
+    
+    try:
+        # Process each start URL
+        for i, start_url in enumerate(request.start_urls, 1):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"📍 Processing Start URL {i}/{len(request.start_urls)}")
+            logger.info(f"🔗 {start_url}")
+            logger.info(f"{'='*60}")
+            
+            rule = {
+                'target_url': start_url,
+                'max_urls': request.max_urls,
+                'max_depth': request.max_depth,
+                'rule_id': request.rule_id,
+                'country_iso': request.country_code,
+                'country_name': request.country_name,
+                'target_group': request.target_group
+            }
+            
+            urls = await discover_urls(rule)
+            discovered_urls.extend(urls)
+            
+            logger.info(f"✅ Found {len(urls)} URLs from this start URL")
+        
+        # Save all URLs to Supabase
+        logger.info(f"\n{'='*80}")
+        logger.info(f"💾 Saving {len(discovered_urls)} total URLs to Supabase...")
+        saved_count = save_urls_to_supabase(discovered_urls)
+        
+        logger.info(f"\n{'='*80}")
+        logger.info("✅ DIRECT DISCOVERY COMPLETED")
+        logger.info(f"📊 Total URLs found: {saved_count}")
+        logger.info(f"{'='*80}")
+        
+        return DirectDiscoveryResponse(
+            success=True,
+            total_urls_found=saved_count,
+            urls=discovered_urls
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Critical error in direct discovery: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/discover", response_model=DiscoveryResponse)
 async def run_discovery(request: DiscoveryRequest):
     """
-    Main endpoint: Runs URL discovery for all active rules
-    Called by n8n HTTP Request Node
+    ORIGINAL ENDPOINT (uses config_rules from Supabase)
+    Runs URL discovery for all active rules from config_rules table
+    Called by n8n for scheduled/batch processing
     
     Supports:
     - rule_ids: List of specific rule IDs to process
@@ -482,9 +576,14 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v1.1.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info("✅ API is ready!")
+    logger.info("📍 Available endpoints:")
+    logger.info("   - GET  /")
+    logger.info("   - GET  /health")
+    logger.info("   - POST /discover (config_rules based)")
+    logger.info("   - POST /discover-direct (direct URLs from n8n)")
 
 if __name__ == "__main__":
     import uvicorn

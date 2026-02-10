@@ -439,19 +439,16 @@ async def discover_direct(request: DirectDiscoveryRequest):
             
             logger.info(f"✅ Found {len(urls)} URLs from this start URL")
         
-        # Save all URLs to Supabase
-        logger.info(f"\n{'='*80}")
-        logger.info(f"💾 Saving {len(discovered_urls)} total URLs to Supabase...")
-        saved_count = save_urls_to_supabase(discovered_urls)
-        
+        # Return URLs to n8n (n8n will handle Supabase saving)
         logger.info(f"\n{'='*80}")
         logger.info("✅ DIRECT DISCOVERY COMPLETED")
-        logger.info(f"📊 Total URLs found: {saved_count}")
+        logger.info(f"📊 Total URLs found: {len(discovered_urls)}")
+        logger.info(f"📤 Returning URLs to n8n for processing...")
         logger.info(f"{'='*80}")
         
         return DirectDiscoveryResponse(
             success=True,
-            total_urls_found=saved_count,
+            total_urls_found=len(discovered_urls),
             urls=discovered_urls
         )
         

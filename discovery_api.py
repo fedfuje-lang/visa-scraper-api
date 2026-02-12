@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
 import tldextract
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
@@ -116,6 +116,16 @@ GENERAL_KEYWORDS = [
 # HELPER FUNCTIONS
 # =============================================================================
 
+def normalize_url(url: str) -> str:
+    """
+    Normalisiert URLs durch Entfernen von Fragmenten (#anchors)
+    Verhindert Duplikate wie example.com und example.com#section
+    """
+    parsed = urlparse(url)
+    # Entferne Fragment (#anchor)
+    normalized = parsed._replace(fragment='').geturl()
+    return normalized
+
 def is_internal(url: str, base_domain: str) -> bool:
     try:
         ext = tldextract.extract(url)
@@ -220,15 +230,18 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         while to_visit and len(visited) < max_pages:
             current_url, depth = to_visit.pop(0)
             
-            if current_url in visited or depth > max_depth:
+            # Normalisiere URL (entferne #anchors)
+            normalized_url = normalize_url(current_url)
+            
+            if normalized_url in visited or depth > max_depth:
                 continue
             
-            visited.add(current_url)
-            logger.info(f"🔎 Crawling ({len(visited)}/{max_pages}, depth={depth}): {current_url}")
+            visited.add(normalized_url)
+            logger.info(f"🔎 Crawling ({len(visited)}/{max_pages}, depth={depth}): {normalized_url}")
             
             try:
                 page = await context.new_page()
-                await page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
+                await page.goto(normalized_url, timeout=30000, wait_until="domcontentloaded")
                 
                 html = await page.content()
                 soup = BeautifulSoup(html, "html.parser")
@@ -237,12 +250,12 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 title_tag = soup.find("title")
                 page_title = title_tag.get_text(strip=True) if title_tag else ""
                 
-                relevance = score_url(current_url, text, rule['target_group'])
-                topics = extract_topics(text, current_url, rule['target_group'])
+                relevance = score_url(normalized_url, text, rule['target_group'])
+                topics = extract_topics(text, normalized_url, rule['target_group'])
                 
                 if relevance >= 3:
                     discovered_urls.append({
-                        "url": current_url,
+                        "url": normalized_url,
                         "page_title": page_title[:500],
                         "relevance_score": relevance,
                         "topics": topics,
@@ -260,19 +273,22 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                         if not href:
                             continue
                         
-                        full_url = urljoin(current_url, href)
+                        full_url = urljoin(normalized_url, href)
                         if not full_url.startswith("http"):
                             continue
                         
-                        if is_internal(full_url, base_domain):
-                            if full_url not in visited:
-                                if full_url not in [u for u, d in to_visit]:
-                                    to_visit.append((full_url, depth + 1))
+                        # Normalisiere auch gefundene URLs
+                        normalized_full_url = normalize_url(full_url)
+                        
+                        if is_internal(normalized_full_url, base_domain):
+                            if normalized_full_url not in visited:
+                                if normalized_full_url not in [u for u, d in to_visit]:
+                                    to_visit.append((normalized_full_url, depth + 1))
                 
                 await page.close()
                 
             except Exception as e:
-                logger.error(f"⚠️ Error crawling {current_url}: {str(e)}")
+                logger.error(f"⚠️ Error crawling {normalized_url}: {str(e)}")
                 continue
         
         await browser.close()
@@ -285,16 +301,36 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
+    """
+    Speichert URLs in Supabase mit Deduplication
+    
+    FIX: Entfernt Duplikate innerhalb des selben Batches
+    Verhindert Supabase Error: ON_CONFLICT cannot affect row a second time
+    """
     if not discovered_urls:
         logger.warning("⚠️ No URLs to save")
         return 0
     
-    logger.info(f"💾 Saving {len(discovered_urls)} URLs to Supabase...")
+    logger.info(f"💾 Preparing to save {len(discovered_urls)} URLs to Supabase...")
     
+    # NEUE LOGIK: Deduplicate URLs im Batch
+    seen_urls = set()
     insert_data = []
+    duplicates_removed = 0
+    
     for url_data in discovered_urls:
+        url = url_data["url"]
+        
+        # Skip wenn URL bereits im aktuellen Batch
+        if url in seen_urls:
+            duplicates_removed += 1
+            logger.debug(f"⚠️ Skipping duplicate URL in batch: {url}")
+            continue
+        
+        seen_urls.add(url)
+        
         insert_data.append({
-            "url": url_data["url"],
+            "url": url,
             "page_title": url_data["page_title"],
             "relevance_score": url_data["relevance_score"],
             "topics": url_data["topics"],
@@ -305,6 +341,11 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
             "target_group": url_data["target_group"],
             "status": "pending"
         })
+    
+    if duplicates_removed > 0:
+        logger.info(f"🧹 Removed {duplicates_removed} duplicate URLs from batch")
+    
+    logger.info(f"💾 Saving {len(insert_data)} unique URLs to Supabase...")
     
     try:
         response = supabase.table("discovered_urls").upsert(

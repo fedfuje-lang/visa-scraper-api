@@ -2,6 +2,8 @@
 URL Discovery API for Visa Scraper
 FastAPI Service deployed on Railway.app
 Calls Python discovery logic and returns results to n8n
+
+v1.2.0 - Added /fetch-markdown endpoint (Jina replacement)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +19,9 @@ import os
 from typing import Optional, List, Dict
 import logging
 
+# Fetch Markdown Router (Jina Replacement)
+from fetch_markdown import router as fetch_markdown_router
+
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,7 +30,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="1.1.0"
+    version="1.2.0"
 )
 
 # CORS Middleware (für n8n)
@@ -36,6 +41,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Fetch Markdown Router einbinden
+app.include_router(fetch_markdown_router)
 
 # Supabase Connection (aus Environment Variables)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -122,7 +130,6 @@ def normalize_url(url: str) -> str:
     Verhindert Duplikate wie example.com und example.com#section
     """
     parsed = urlparse(url)
-    # Entferne Fragment (#anchor)
     normalized = parsed._replace(fragment='').geturl()
     return normalized
 
@@ -230,7 +237,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         while to_visit and len(visited) < max_pages:
             current_url, depth = to_visit.pop(0)
             
-            # Normalisiere URL (entferne #anchors)
             normalized_url = normalize_url(current_url)
             
             if normalized_url in visited or depth > max_depth:
@@ -277,7 +283,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                         if not full_url.startswith("http"):
                             continue
                         
-                        # Normalisiere auch gefundene URLs
                         normalized_full_url = normalize_url(full_url)
                         
                         if is_internal(normalized_full_url, base_domain):
@@ -303,8 +308,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     """
     Speichert URLs in Supabase mit Deduplication
-    
-    FIX: Entfernt Duplikate innerhalb des selben Batches
     Verhindert Supabase Error: ON_CONFLICT cannot affect row a second time
     """
     if not discovered_urls:
@@ -313,7 +316,6 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     
     logger.info(f"💾 Preparing to save {len(discovered_urls)} URLs to Supabase...")
     
-    # NEUE LOGIK: Deduplicate URLs im Batch
     seen_urls = set()
     insert_data = []
     duplicates_removed = 0
@@ -321,7 +323,6 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     for url_data in discovered_urls:
         url = url_data["url"]
         
-        # Skip wenn URL bereits im aktuellen Batch
         if url in seen_urls:
             duplicates_removed += 1
             logger.debug(f"⚠️ Skipping duplicate URL in batch: {url}")
@@ -381,10 +382,6 @@ class DiscoveryRequest(BaseModel):
     max_urls: Optional[int] = None
 
 class DirectDiscoveryRequest(BaseModel):
-    """
-    NEW: Direct discovery request for n8n Workflow 1
-    Accepts start_urls directly without Supabase config_rules
-    """
     start_urls: List[str]
     country_code: str
     country_name: str
@@ -410,11 +407,12 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "status": "running",
         "endpoints": {
             "discover": "/discover (uses config_rules from Supabase)",
             "discover-direct": "/discover-direct (direct URLs from n8n)",
+            "fetch-markdown": "/fetch-markdown?url=... (Jina replacement)",
             "health": "/health"
         }
     }
@@ -429,23 +427,8 @@ async def health():
 @app.post("/discover-direct", response_model=DirectDiscoveryResponse)
 async def discover_direct(request: DirectDiscoveryRequest):
     """
-    NEW ENDPOINT FOR N8N WORKFLOW 1
-    
     Accepts start_urls directly (no Supabase config_rules needed)
     Crawls all start_urls, combines results, saves to discovered_urls
-    Returns URLs for n8n logging/debugging
-    
-    Usage:
-    POST /discover-direct
-    {
-        "start_urls": ["https://...", "https://..."],
-        "country_code": "US",
-        "country_name": "United States",
-        "target_group": "GROUP A: VISA & RECHT",
-        "rule_id": "US-VISA-A",
-        "max_depth": 3,
-        "max_urls": 100
-    }
     """
     
     logger.info("="*80)
@@ -458,11 +441,9 @@ async def discover_direct(request: DirectDiscoveryRequest):
     discovered_urls = []
     
     try:
-        # Process each start URL
         for i, start_url in enumerate(request.start_urls, 1):
             logger.info(f"\n{'='*60}")
-            logger.info(f"📍 Processing Start URL {i}/{len(request.start_urls)}")
-            logger.info(f"🔗 {start_url}")
+            logger.info(f"📍 Processing Start URL {i}/{len(request.start_urls)}: {start_url}")
             logger.info(f"{'='*60}")
             
             rule = {
@@ -477,17 +458,13 @@ async def discover_direct(request: DirectDiscoveryRequest):
             
             urls = await discover_urls(rule)
             discovered_urls.extend(urls)
-            
             logger.info(f"✅ Found {len(urls)} URLs from this start URL")
         
-        # Save URLs to Supabase
         logger.info(f"\n{'='*80}")
         logger.info(f"💾 Saving {len(discovered_urls)} URLs to Supabase...")
         saved_count = save_urls_to_supabase(discovered_urls)
         
-        logger.info(f"\n{'='*80}")
-        logger.info("✅ DIRECT DISCOVERY COMPLETED")
-        logger.info(f"📊 Total URLs saved: {saved_count}")
+        logger.info(f"✅ DIRECT DISCOVERY COMPLETED – {saved_count} URLs saved")
         logger.info(f"{'='*80}")
         
         return DirectDiscoveryResponse(
@@ -505,12 +482,6 @@ async def run_discovery(request: DiscoveryRequest):
     """
     ORIGINAL ENDPOINT (uses config_rules from Supabase)
     Runs URL discovery for all active rules from config_rules table
-    Called by n8n for scheduled/batch processing
-    
-    Supports:
-    - rule_ids: List of specific rule IDs to process
-    - filter: Dict with country_iso and/or target_group
-    - max_urls: Override max_urls from config_rules
     """
     
     logger.info("="*80)
@@ -519,22 +490,17 @@ async def run_discovery(request: DiscoveryRequest):
     logger.info("="*80)
     
     try:
-        # Load active rules from Supabase
         query = supabase.table("config_rules").select("*").eq("active", True)
         
-        # Filter by rule_ids if provided
         if request.rule_ids:
             query = query.in_("rule_id", request.rule_ids)
             logger.info(f"🔍 Filtering by rule_ids: {request.rule_ids}")
         
-        # Filter by country_iso and/or target_group if provided
         if request.filter:
             if "country_iso" in request.filter:
                 query = query.eq("country_iso", request.filter["country_iso"])
-                logger.info(f"🔍 Filtering by country_iso: {request.filter['country_iso']}")
             if "target_group" in request.filter:
                 query = query.eq("target_group", request.filter["target_group"])
-                logger.info(f"🔍 Filtering by target_group: {request.filter['target_group']}")
         
         response = query.execute()
         rules = response.data
@@ -552,22 +518,17 @@ async def run_discovery(request: DiscoveryRequest):
         
         logger.info(f"✅ Found {len(rules)} active rules")
         
-        # Process each rule
         total_urls_found = 0
         results_per_rule = []
         
         for i, rule in enumerate(rules, 1):
             logger.info(f"\n{'='*80}")
-            logger.info(f"📍 Rule {i}/{len(rules)}: {rule['rule_id']}")
-            logger.info(f"🌍 Country: {rule['country_name']}")
-            logger.info(f"📂 Group: {rule['target_group']}")
+            logger.info(f"📍 Rule {i}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
             logger.info(f"{'='*80}")
             
             try:
-                # Override max_urls if provided in request
                 if request.max_urls:
                     rule['max_urls'] = request.max_urls
-                    logger.info(f"🔧 Overriding max_urls to {request.max_urls}")
                 
                 discovered_urls = await discover_urls(rule)
                 saved_count = save_urls_to_supabase(discovered_urls)
@@ -594,8 +555,7 @@ async def run_discovery(request: DiscoveryRequest):
                 })
         
         logger.info(f"\n{'='*80}")
-        logger.info("✅ DISCOVERY API COMPLETED")
-        logger.info(f"📊 Total URLs found: {total_urls_found}")
+        logger.info(f"✅ DISCOVERY API COMPLETED – Total URLs: {total_urls_found}")
         logger.info(f"{'='*80}")
         
         return DiscoveryResponse(
@@ -617,7 +577,7 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v1.1.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v1.2.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info("✅ API is ready!")
     logger.info("📍 Available endpoints:")
@@ -625,6 +585,7 @@ async def startup_event():
     logger.info("   - GET  /health")
     logger.info("   - POST /discover (config_rules based)")
     logger.info("   - POST /discover-direct (direct URLs from n8n)")
+    logger.info("   - GET  /fetch-markdown?url=... (Jina replacement)")
 
 if __name__ == "__main__":
     import uvicorn

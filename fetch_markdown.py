@@ -5,11 +5,16 @@ Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
 Response format: { "data": "markdown..." }
 Compatible with existing Clean Markdown Code Node in n8n WF2
+
+v1.3.0 - Added /fetch-markdown-batch endpoint for parallel processing
 """
 
 from fastapi import APIRouter, HTTPException, Query
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup, NavigableString
+from pydantic import BaseModel
+from typing import List
+import asyncio
 import logging
 import re
 
@@ -28,10 +33,8 @@ router = APIRouter()
 def is_pdf_url(url: str) -> bool:
     """Erkennt ob eine URL auf eine PDF zeigt"""
     url_lower = url.lower().strip()
-    # Direkte .pdf Extension
     if url_lower.endswith(".pdf"):
         return True
-    # PDF in Query-String (z.B. ?file=doc.pdf)
     if ".pdf?" in url_lower or ".pdf#" in url_lower:
         return True
     return False
@@ -41,25 +44,17 @@ def is_pdf_url(url: str) -> bool:
 # =============================================================================
 
 def html_to_markdown(html: str, url: str = "") -> str:
-    """
-    Konvertiert HTML zu sauberem Markdown
-    Erhält Tabellen, Listen, Überschriften
-    Entfernt Navigation, Footer, Scripts, Ads
-    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Entferne irrelevante Elemente
     for tag in soup(["script", "style", "nav", "footer", "header",
                      "aside", "noscript", "iframe", "svg", "button",
                      "form", "input", "select", "textarea", "meta",
                      "link", "figure", "figcaption"]):
         tag.decompose()
 
-    # Entferne versteckte Elemente
     for tag in soup.find_all(style=re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden")):
         tag.decompose()
 
-    # Finde den Hauptinhalt (Content-Bereich)
     main_content = (
         soup.find("main") or
         soup.find("article") or
@@ -72,18 +67,13 @@ def html_to_markdown(html: str, url: str = "") -> str:
     lines = []
     _convert_element(main_content, lines)
 
-    # Zusammenführen und bereinigen
     markdown = "\n".join(lines)
-
-    # Mehrfache Leerzeilen reduzieren
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
 
     return markdown.strip()
 
 
 def _convert_element(element, lines: list, depth: int = 0):
-    """Rekursiv HTML-Elemente zu Markdown konvertieren"""
-
     if isinstance(element, NavigableString):
         text = str(element).strip()
         if text:
@@ -92,7 +82,6 @@ def _convert_element(element, lines: list, depth: int = 0):
 
     tag = element.name if element.name else ""
 
-    # Überschriften
     if tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
         level = int(tag[1])
         text = element.get_text(" ", strip=True)
@@ -100,21 +89,18 @@ def _convert_element(element, lines: list, depth: int = 0):
             lines.append(f"\n{'#' * level} {text}\n")
         return
 
-    # Paragraphen
     if tag == "p":
         text = element.get_text(" ", strip=True)
         if text:
             lines.append(f"\n{text}\n")
         return
 
-    # Tabellen → Markdown Tabelle
     if tag == "table":
         table_md = _convert_table(element)
         if table_md:
             lines.append(f"\n{table_md}\n")
         return
 
-    # Listen
     if tag in ["ul", "ol"]:
         lines.append("")
         for i, li in enumerate(element.find_all("li", recursive=False), 1):
@@ -125,7 +111,6 @@ def _convert_element(element, lines: list, depth: int = 0):
         lines.append("")
         return
 
-    # Links → Text mit URL
     if tag == "a":
         text = element.get_text(" ", strip=True)
         href = element.get("href", "").strip()
@@ -135,7 +120,6 @@ def _convert_element(element, lines: list, depth: int = 0):
             lines.append(text)
         return
 
-    # Fett / Kursiv
     if tag in ["strong", "b"]:
         text = element.get_text(" ", strip=True)
         if text:
@@ -148,27 +132,19 @@ def _convert_element(element, lines: list, depth: int = 0):
             lines.append(f"*{text}*")
         return
 
-    # Zeilenumbruch
     if tag == "br":
         lines.append("\n")
         return
 
-    # Horizontale Linie
     if tag == "hr":
         lines.append("\n---\n")
         return
 
-    # Alles andere: Kinder rekursiv verarbeiten
     for child in element.children:
         _convert_element(child, lines, depth + 1)
 
 
 def _convert_table(table_element) -> str:
-    """Konvertiert HTML-Tabelle zu Markdown-Tabelle"""
-    rows = []
-
-    # Header-Zeilen
-    header_rows = table_element.find_all("tr", limit=1)
     all_rows = table_element.find_all("tr")
 
     if not all_rows:
@@ -186,7 +162,6 @@ def _convert_table(table_element) -> str:
         row_str = "| " + " | ".join(cell_texts) + " |"
         markdown_rows.append(row_str)
 
-        # Separator nach erster Zeile (Header)
         if row_idx == 0 and not separator_added:
             separator = "| " + " | ".join(["---"] * len(cells)) + " |"
             markdown_rows.append(separator)
@@ -199,11 +174,6 @@ def _convert_table(table_element) -> str:
 # =============================================================================
 
 def calculate_quality_score(markdown: str) -> dict:
-    """
-    Berechnet Qualitäts-Score für extrahierten Markdown-Content
-    Kompatibel mit dem bestehenden Pre-Check in WF2
-    Score 0-10
-    """
     score = 0
     details = {}
 
@@ -216,7 +186,6 @@ def calculate_quality_score(markdown: str) -> dict:
     elif word_count > 50:
         score += 1
 
-    # Zahlen und Währungen (wichtig für Finanz/Visa-Daten)
     numbers = re.findall(r'\b\d+[\.,]?\d*\b', markdown)
     currency_pattern = re.findall(r'[$€£¥₹]\s*\d+|\d+\s*(?:USD|EUR|GBP|CHF|AUD|CAD)', markdown)
     details["numbers_found"] = len(numbers)
@@ -228,19 +197,16 @@ def calculate_quality_score(markdown: str) -> dict:
     if currency_pattern:
         score += 1
 
-    # Tabellen (strukturierte Daten)
     table_count = markdown.count("| ---")
     details["tables_found"] = table_count
     if table_count > 0:
         score += 2
-    
-    # Überschriften (strukturierter Content)
+
     heading_count = len(re.findall(r'^#{1,6} ', markdown, re.MULTILINE))
     details["headings_found"] = heading_count
     if heading_count > 3:
         score += 1
 
-    # Links (Navigation-Check – zu viele Links = schlechter Content)
     link_count = len(re.findall(r'\[.+?\]\(.+?\)', markdown))
     details["links_found"] = link_count
     if link_count > 50:
@@ -257,16 +223,10 @@ def calculate_quality_score(markdown: str) -> dict:
 # =============================================================================
 
 async def fetch_and_convert(url: str) -> dict:
-    """
-    Hauptfunktion: URL → sauberes Markdown
-    Gibt kompatibles Format zurück: { "data": "markdown..." }
-    """
-
-    # PDF-Erkennung
     if is_pdf_url(url):
         logger.warning(f"📄 PDF detected, skipping: {url}")
         return {
-            "data": f"[PDF-Dokument erkannt – direkte Extraktion nicht unterstützt]\nURL: {url}\n\nHinweis: Dieses Dokument ist eine PDF-Datei und kann nicht automatisch als Markdown extrahiert werden. Bitte manuell prüfen.",
+            "data": f"[PDF-Dokument erkannt – direkte Extraktion nicht unterstützt]\nURL: {url}",
             "url": url,
             "content_type": "pdf",
             "quality_score": 0,
@@ -291,35 +251,26 @@ async def fetch_and_convert(url: str) -> dict:
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
-            # Bilder und Fonts blockieren → schneller
             extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
         )
 
-        # Bilder, Fonts, Media blockieren für Speed
-        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}", 
+        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
                            lambda route: route.abort())
-        await context.route("**/{analytics,tracking,ads,doubleclick}**", 
+        await context.route("**/{analytics,tracking,ads,doubleclick}**",
                            lambda route: route.abort())
 
         try:
             page = await context.new_page()
+            response = await page.goto(url, timeout=30000, wait_until="domcontentloaded")
 
-            response = await page.goto(
-                url,
-                timeout=30000,
-                wait_until="domcontentloaded"
-            )
-
-            # Check ob PDF über Content-Type
             content_type = ""
             if response:
                 content_type = response.headers.get("content-type", "")
 
             if "application/pdf" in content_type:
                 await browser.close()
-                logger.warning(f"📄 PDF detected via Content-Type: {url}")
                 return {
-                    "data": f"[PDF-Dokument erkannt via Content-Type]\nURL: {url}\n\nHinweis: Server liefert PDF-Datei. Direkte Extraktion nicht unterstützt.",
+                    "data": f"[PDF-Dokument erkannt via Content-Type]\nURL: {url}",
                     "url": url,
                     "content_type": "pdf",
                     "quality_score": 0,
@@ -328,9 +279,7 @@ async def fetch_and_convert(url: str) -> dict:
                     "error": "PDF detected via Content-Type"
                 }
 
-            # Kurz warten damit JS rendern kann
             await page.wait_for_timeout(1500)
-
             html = await page.content()
             await browser.close()
 
@@ -339,18 +288,13 @@ async def fetch_and_convert(url: str) -> dict:
             logger.error(f"❌ Playwright error for {url}: {str(e)}")
             raise
 
-    # HTML → Markdown
     markdown = html_to_markdown(html, url)
-
-    # Qualitäts-Score
     quality = calculate_quality_score(markdown)
 
     logger.info(f"✅ Fetched {url} → {quality['word_count']} words, score: {quality['final_score']}/10")
 
     return {
-        # Hauptfeld: kompatibel mit bestehendem Clean Markdown Code Node
         "data": markdown,
-        # Zusatzfelder für Debugging / n8n Logging
         "url": url,
         "content_type": "html",
         "quality_score": quality["final_score"],
@@ -360,49 +304,27 @@ async def fetch_and_convert(url: str) -> dict:
     }
 
 # =============================================================================
-# API ENDPOINT
+# API ENDPOINTS
 # =============================================================================
 
 @router.get("/fetch-markdown")
 async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetch and convert to Markdown")):
     """
-    JINA REPLACEMENT ENDPOINT
-    
-    Fetches a URL and converts it to clean Markdown.
-    Response format compatible with existing n8n Clean Markdown Code Node.
-    
-    Usage in n8n (replaces Jina HTTP Node):
-    GET https://your-railway-url/fetch-markdown?url={url}
-    
-    Response:
-    {
-        "data": "# Page Title\\n\\nContent...",
-        "url": "https://...",
-        "quality_score": 7,
-        "success": true
-    }
-    
-    Jina equivalent was:
-    GET https://r.jina.ai/{url}
+    EINZELNER URL ENDPOINT (unverändert)
+    GET /fetch-markdown?url=https://...
     """
-    
     if not url:
         raise HTTPException(status_code=400, detail="url parameter is required")
-    
     if not url.startswith("http"):
         raise HTTPException(status_code=400, detail="url must start with http:// or https://")
-    
+
     try:
         result = await fetch_and_convert(url)
         return result
-        
     except Exception as e:
         logger.error(f"❌ Error fetching {url}: {str(e)}")
-        
-        # Kein Hard-Crash – saubere Fehlermeldung zurückgeben
-        # Clean Markdown Node bekommt trotzdem ein valides { data: ... } Objekt
         return {
-            "data": f"[Fehler beim Laden der Seite]\nURL: {url}\nFehler: {str(e)}\n\nDiese URL konnte nicht verarbeitet werden.",
+            "data": f"[Fehler beim Laden der Seite]\nURL: {url}\nFehler: {str(e)}",
             "url": url,
             "content_type": "error",
             "quality_score": 0,
@@ -410,3 +332,75 @@ async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetc
             "success": False,
             "error": str(e)
         }
+
+
+# =============================================================================
+# NEU: BATCH ENDPOINT (3 URLs parallel)
+# =============================================================================
+
+class BatchRequest(BaseModel):
+    urls: List[str]
+
+@router.post("/fetch-markdown-batch")
+async def fetch_markdown_batch(request: BatchRequest):
+    """
+    BATCH ENDPOINT – bis zu 3 URLs parallel verarbeiten
+    
+    POST /fetch-markdown-batch
+    Body: { "urls": ["https://url1", "https://url2", "https://url3"] }
+    
+    Response:
+    {
+        "results": [
+            { "data": "...", "url": "...", "quality_score": 7, "success": true },
+            { "data": "...", "url": "...", "quality_score": 5, "success": true },
+            { "data": "...", "url": "...", "quality_score": 0, "success": false }
+        ],
+        "total": 3,
+        "successful": 2,
+        "failed": 1
+    }
+    """
+
+    if not request.urls:
+        raise HTTPException(status_code=400, detail="urls list is required")
+
+    # Max 3 URLs pro Batch
+    urls = request.urls[:3]
+
+    logger.info(f"🚀 Batch fetch started: {len(urls)} URLs")
+
+    # Alle URLs parallel fetchen
+    raw_results = await asyncio.gather(
+        *[fetch_and_convert(url) for url in urls],
+        return_exceptions=True
+    )
+
+    # Ergebnisse aufbereiten – Exceptions sauber behandeln
+    results = []
+    for i, result in enumerate(raw_results):
+        if isinstance(result, Exception):
+            logger.error(f"❌ Batch item {i} failed: {str(result)}")
+            results.append({
+                "data": f"[Fehler beim Laden der Seite]\nURL: {urls[i]}\nFehler: {str(result)}",
+                "url": urls[i],
+                "content_type": "error",
+                "quality_score": 0,
+                "quality_details": {"quality_status": "fetch_error", "word_count": 0},
+                "success": False,
+                "error": str(result)
+            })
+        else:
+            results.append(result)
+
+    successful = sum(1 for r in results if r.get("success", False))
+    failed = len(results) - successful
+
+    logger.info(f"✅ Batch complete: {successful} successful, {failed} failed")
+
+    return {
+        "results": results,
+        "total": len(results),
+        "successful": successful,
+        "failed": failed
+    }

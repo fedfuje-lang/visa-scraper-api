@@ -3,6 +3,7 @@ URL Discovery API for Visa Scraper
 FastAPI Service deployed on Railway.app
 Calls Python discovery logic and returns results to n8n
 
+v1.3.0 - GROUP B excluded from Discovery (World Bank API handles GROUP B)
 v1.2.0 - Added /fetch-markdown endpoint (Jina replacement)
 """
 
@@ -22,6 +23,9 @@ import logging
 # Fetch Markdown Router (Jina Replacement)
 from fetch_markdown import router as fetch_markdown_router
 
+# World Bank Router (GROUP B Finanzen)
+from fetch_worldbank import router as fetch_worldbank_router
+
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,7 +34,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # CORS Middleware (für n8n)
@@ -42,8 +46,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Fetch Markdown Router einbinden
+# Router einbinden
 app.include_router(fetch_markdown_router)
+app.include_router(fetch_worldbank_router)
 
 # Supabase Connection (aus Environment Variables)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -55,7 +60,13 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================================================================
-# KEYWORDS CONFIG (4 GRUPPEN)
+# GROUP B wird von World Bank API gehandelt – nicht von Discovery
+# =============================================================================
+
+EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
+
+# =============================================================================
+# KEYWORDS CONFIG (nur noch A, E, F)
 # =============================================================================
 
 GROUP_KEYWORDS = {
@@ -69,17 +80,6 @@ GROUP_KEYWORDS = {
         "eb-1", "eb-2", "eb-3", "eb-5", "h-1b", "l-1", "o-1",
         "legal status", "authorization", "immigration law", "attorney",
         "lawyer", "appeal", "denial", "approval", "biometrics"
-    ],
-    "GROUP B: FINANZEN": [
-        "cost", "fee", "price", "payment", "finance", "expense",
-        "budget", "money", "salary", "income", "tax", "taxes",
-        "living cost", "cost of living", "rent", "housing cost",
-        "food cost", "grocery", "transport cost", "utilities",
-        "insurance", "health insurance", "bank", "banking",
-        "account", "credit card", "currency", "exchange rate",
-        "minimum wage", "average salary", "income tax", "vat",
-        "social security", "pension", "savings", "investment",
-        "financial", "afford", "expensive", "cheap", "pricing"
     ],
     "GROUP E: BILDUNG": [
         "education", "school", "university", "college", "study",
@@ -125,10 +125,6 @@ GENERAL_KEYWORDS = [
 # =============================================================================
 
 def normalize_url(url: str) -> str:
-    """
-    Normalisiert URLs durch Entfernen von Fragmenten (#anchors)
-    Verhindert Duplikate wie example.com und example.com#section
-    """
     parsed = urlparse(url)
     normalized = parsed._replace(fragment='').geturl()
     return normalized
@@ -180,12 +176,6 @@ def extract_topics(text: str, url: str, target_group: str) -> List[str]:
             "visa application": ["application", "form", "filing"],
             "legal rights": ["legal", "rights", "law", "attorney"]
         },
-        "GROUP B: FINANZEN": {
-            "living costs": ["cost of living", "living expenses"],
-            "housing costs": ["rent", "housing cost"],
-            "taxes": ["tax", "income tax", "vat"],
-            "banking": ["bank", "account", "credit card"]
-        },
         "GROUP E: BILDUNG": {
             "universities": ["university", "college"],
             "schools": ["school", "kindergarten", "elementary"],
@@ -236,7 +226,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         
         while to_visit and len(visited) < max_pages:
             current_url, depth = to_visit.pop(0)
-            
             normalized_url = normalize_url(current_url)
             
             if normalized_url in visited or depth > max_depth:
@@ -278,13 +267,10 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                         href = a_tag.get("href", "").strip()
                         if not href:
                             continue
-                        
                         full_url = urljoin(normalized_url, href)
                         if not full_url.startswith("http"):
                             continue
-                        
                         normalized_full_url = normalize_url(full_url)
-                        
                         if is_internal(normalized_full_url, base_domain):
                             if normalized_full_url not in visited:
                                 if normalized_full_url not in [u for u, d in to_visit]:
@@ -306,10 +292,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
-    """
-    Speichert URLs in Supabase mit Deduplication
-    Verhindert Supabase Error: ON_CONFLICT cannot affect row a second time
-    """
     if not discovered_urls:
         logger.warning("⚠️ No URLs to save")
         return 0
@@ -322,14 +304,10 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     
     for url_data in discovered_urls:
         url = url_data["url"]
-        
         if url in seen_urls:
             duplicates_removed += 1
-            logger.debug(f"⚠️ Skipping duplicate URL in batch: {url}")
             continue
-        
         seen_urls.add(url)
-        
         insert_data.append({
             "url": url,
             "page_title": url_data["page_title"],
@@ -346,18 +324,14 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     if duplicates_removed > 0:
         logger.info(f"🧹 Removed {duplicates_removed} duplicate URLs from batch")
     
-    logger.info(f"💾 Saving {len(insert_data)} unique URLs to Supabase...")
-    
     try:
         response = supabase.table("discovered_urls").upsert(
             insert_data,
             on_conflict="url"
         ).execute()
-        
         inserted_count = len(response.data) if response.data else 0
         logger.info(f"✅ {inserted_count} URLs saved successfully")
         return inserted_count
-        
     except Exception as e:
         logger.error(f"❌ Error saving to Supabase: {str(e)}")
         return 0
@@ -407,12 +381,14 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "status": "running",
         "endpoints": {
-            "discover": "/discover (uses config_rules from Supabase)",
+            "discover": "/discover (GROUP A, E, F only – GROUP B via World Bank)",
             "discover-direct": "/discover-direct (direct URLs from n8n)",
             "fetch-markdown": "/fetch-markdown?url=... (Jina replacement)",
+            "fetch-markdown-batch": "/fetch-markdown-batch (3 URLs parallel)",
+            "fetch-worldbank": "/fetch-worldbank (GROUP B Finanzen)",
             "health": "/health"
         }
     }
@@ -428,9 +404,18 @@ async def health():
 async def discover_direct(request: DirectDiscoveryRequest):
     """
     Accepts start_urls directly (no Supabase config_rules needed)
-    Crawls all start_urls, combines results, saves to discovered_urls
+    GROUP B wird automatisch abgelehnt
     """
     
+    # GROUP B blockieren
+    if any(excluded in request.target_group for excluded in EXCLUDED_FROM_DISCOVERY):
+        logger.warning(f"⚠️ GROUP B rejected from discovery – use /fetch-worldbank instead")
+        return DirectDiscoveryResponse(
+            success=False,
+            total_urls_found=0,
+            urls=[]
+        )
+
     logger.info("="*80)
     logger.info("🚀 DIRECT DISCOVERY STARTED")
     logger.info(f"📋 Country: {request.country_name} ({request.country_code})")
@@ -442,10 +427,6 @@ async def discover_direct(request: DirectDiscoveryRequest):
     
     try:
         for i, start_url in enumerate(request.start_urls, 1):
-            logger.info(f"\n{'='*60}")
-            logger.info(f"📍 Processing Start URL {i}/{len(request.start_urls)}: {start_url}")
-            logger.info(f"{'='*60}")
-            
             rule = {
                 'target_url': start_url,
                 'max_urls': request.max_urls,
@@ -455,17 +436,12 @@ async def discover_direct(request: DirectDiscoveryRequest):
                 'country_name': request.country_name,
                 'target_group': request.target_group
             }
-            
             urls = await discover_urls(rule)
             discovered_urls.extend(urls)
             logger.info(f"✅ Found {len(urls)} URLs from this start URL")
         
-        logger.info(f"\n{'='*80}")
-        logger.info(f"💾 Saving {len(discovered_urls)} URLs to Supabase...")
         saved_count = save_urls_to_supabase(discovered_urls)
-        
         logger.info(f"✅ DIRECT DISCOVERY COMPLETED – {saved_count} URLs saved")
-        logger.info(f"{'='*80}")
         
         return DirectDiscoveryResponse(
             success=True,
@@ -481,11 +457,11 @@ async def discover_direct(request: DirectDiscoveryRequest):
 async def run_discovery(request: DiscoveryRequest):
     """
     ORIGINAL ENDPOINT (uses config_rules from Supabase)
-    Runs URL discovery for all active rules from config_rules table
+    GROUP B: FINANZEN wird automatisch übersprungen – World Bank API übernimmt
     """
     
     logger.info("="*80)
-    logger.info("🚀 DISCOVERY API STARTED")
+    logger.info("🚀 DISCOVERY API STARTED (v1.3.0 – GROUP B excluded)")
     logger.info(f"📋 Request: {request.dict()}")
     logger.info("="*80)
     
@@ -494,7 +470,6 @@ async def run_discovery(request: DiscoveryRequest):
         
         if request.rule_ids:
             query = query.in_("rule_id", request.rule_ids)
-            logger.info(f"🔍 Filtering by rule_ids: {request.rule_ids}")
         
         if request.filter:
             if "country_iso" in request.filter:
@@ -503,10 +478,10 @@ async def run_discovery(request: DiscoveryRequest):
                 query = query.eq("target_group", request.filter["target_group"])
         
         response = query.execute()
-        rules = response.data
+        all_rules = response.data
         
-        if not rules:
-            logger.warning("⚠️ No active rules found matching criteria")
+        if not all_rules:
+            logger.warning("⚠️ No active rules found")
             return DiscoveryResponse(
                 success=False,
                 total_rules_processed=0,
@@ -516,7 +491,17 @@ async def run_discovery(request: DiscoveryRequest):
                 results_per_rule=[]
             )
         
-        logger.info(f"✅ Found {len(rules)} active rules")
+        # GROUP B herausfiltern
+        rules = [
+            r for r in all_rules
+            if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)
+        ]
+        skipped = len(all_rules) - len(rules)
+
+        if skipped > 0:
+            logger.info(f"⏭️ Skipped {skipped} GROUP B rules (handled by World Bank API)")
+        
+        logger.info(f"✅ Processing {len(rules)} rules (GROUP A, E, F only)")
         
         total_urls_found = 0
         results_per_rule = []
@@ -555,7 +540,7 @@ async def run_discovery(request: DiscoveryRequest):
                 })
         
         logger.info(f"\n{'='*80}")
-        logger.info(f"✅ DISCOVERY API COMPLETED – Total URLs: {total_urls_found}")
+        logger.info(f"✅ DISCOVERY COMPLETED – Total URLs: {total_urls_found}")
         logger.info(f"{'='*80}")
         
         return DiscoveryResponse(
@@ -577,15 +562,11 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v1.2.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v1.3.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info("✅ API is ready!")
-    logger.info("📍 Available endpoints:")
-    logger.info("   - GET  /")
-    logger.info("   - GET  /health")
-    logger.info("   - POST /discover (config_rules based)")
-    logger.info("   - POST /discover-direct (direct URLs from n8n)")
-    logger.info("   - GET  /fetch-markdown?url=... (Jina replacement)")
+    logger.info("📍 Endpoints: /, /health, /discover, /discover-direct, /fetch-markdown, /fetch-markdown-batch, /fetch-worldbank")
+    logger.info("⚠️  GROUP B: FINANZEN excluded from discovery – use /fetch-worldbank")
 
 if __name__ == "__main__":
     import uvicorn

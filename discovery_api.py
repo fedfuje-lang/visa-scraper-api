@@ -3,6 +3,7 @@ URL Discovery API for Visa Scraper
 FastAPI Service deployed on Railway.app
 Calls Python discovery logic and returns results to n8n
 
+v1.4.0 - fetch_worldbank replaced by fetch_apis (generic API fetcher)
 v1.3.0 - GROUP B excluded from Discovery (World Bank API handles GROUP B)
 v1.2.0 - Added /fetch-markdown endpoint (Jina replacement)
 """
@@ -23,8 +24,8 @@ import logging
 # Fetch Markdown Router (Jina Replacement)
 from fetch_markdown import router as fetch_markdown_router
 
-# World Bank Router (GROUP B Finanzen)
-from fetch_worldbank import router as fetch_worldbank_router
+# Generic API Fetcher Router (GROUP B Finanzen – World Bank, BLS, Eurostat...)
+from fetch_apis import router as fetch_apis_router
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 # CORS Middleware (für n8n)
@@ -48,7 +49,7 @@ app.add_middleware(
 
 # Router einbinden
 app.include_router(fetch_markdown_router)
-app.include_router(fetch_worldbank_router)
+app.include_router(fetch_apis_router)
 
 # Supabase Connection (aus Environment Variables)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -60,7 +61,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================================================================
-# GROUP B wird von World Bank API gehandelt – nicht von Discovery
+# GROUP B wird von fetch_apis gehandelt – nicht von Discovery
 # =============================================================================
 
 EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
@@ -381,14 +382,14 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "1.3.0",
+        "version": "1.4.0",
         "status": "running",
         "endpoints": {
-            "discover": "/discover (GROUP A, E, F only – GROUP B via World Bank)",
+            "discover": "/discover (GROUP A, E, F only – GROUP B via fetch-apis)",
             "discover-direct": "/discover-direct (direct URLs from n8n)",
             "fetch-markdown": "/fetch-markdown?url=... (Jina replacement)",
             "fetch-markdown-batch": "/fetch-markdown-batch (3 URLs parallel)",
-            "fetch-worldbank": "/fetch-worldbank (GROUP B Finanzen)",
+            "fetch-apis": "/fetch-apis (GROUP B Finanzen – World Bank, BLS, Eurostat)",
             "health": "/health"
         }
     }
@@ -407,9 +408,8 @@ async def discover_direct(request: DirectDiscoveryRequest):
     GROUP B wird automatisch abgelehnt
     """
     
-    # GROUP B blockieren
     if any(excluded in request.target_group for excluded in EXCLUDED_FROM_DISCOVERY):
-        logger.warning(f"⚠️ GROUP B rejected from discovery – use /fetch-worldbank instead")
+        logger.warning(f"⚠️ GROUP B rejected from discovery – use /fetch-apis instead")
         return DirectDiscoveryResponse(
             success=False,
             total_urls_found=0,
@@ -457,11 +457,11 @@ async def discover_direct(request: DirectDiscoveryRequest):
 async def run_discovery(request: DiscoveryRequest):
     """
     ORIGINAL ENDPOINT (uses config_rules from Supabase)
-    GROUP B: FINANZEN wird automatisch übersprungen – World Bank API übernimmt
+    GROUP B: FINANZEN wird automatisch übersprungen – fetch-apis übernimmt
     """
     
     logger.info("="*80)
-    logger.info("🚀 DISCOVERY API STARTED (v1.3.0 – GROUP B excluded)")
+    logger.info("🚀 DISCOVERY API STARTED (v1.4.0 – GROUP B via fetch-apis)")
     logger.info(f"📋 Request: {request.dict()}")
     logger.info("="*80)
     
@@ -499,7 +499,7 @@ async def run_discovery(request: DiscoveryRequest):
         skipped = len(all_rules) - len(rules)
 
         if skipped > 0:
-            logger.info(f"⏭️ Skipped {skipped} GROUP B rules (handled by World Bank API)")
+            logger.info(f"⏭️ Skipped {skipped} GROUP B rules (handled by fetch-apis)")
         
         logger.info(f"✅ Processing {len(rules)} rules (GROUP A, E, F only)")
         
@@ -562,11 +562,11 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v1.3.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v1.4.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info("✅ API is ready!")
-    logger.info("📍 Endpoints: /, /health, /discover, /discover-direct, /fetch-markdown, /fetch-markdown-batch, /fetch-worldbank")
-    logger.info("⚠️  GROUP B: FINANZEN excluded from discovery – use /fetch-worldbank")
+    logger.info("📍 Endpoints: /, /health, /discover, /discover-direct, /fetch-markdown, /fetch-markdown-batch, /fetch-apis")
+    logger.info("⚠️  GROUP B: FINANZEN excluded from discovery – use /fetch-apis")
 
 if __name__ == "__main__":
     import uvicorn

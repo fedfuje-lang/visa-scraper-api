@@ -225,6 +225,7 @@ async def process_country(country: dict, api_rules: List[dict]) -> dict:
         "country_code": country_code,
         "country_name": country_name,
         "rule_id": f"{country_code}-COSTS",
+        "source_url": "api://fetch-apis",
         "updated_at": today,
     }
 

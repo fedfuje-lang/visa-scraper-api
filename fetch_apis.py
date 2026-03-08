@@ -224,6 +224,7 @@ async def process_country(country: dict, api_rules: List[dict]) -> dict:
     upsert_data = {
         "country_code": country_code,
         "country_name": country_name,
+        "rule_id": f"{country_code}-COSTS",
         "updated_at": today,
     }
 

@@ -232,8 +232,13 @@ async def process_country(country: dict, api_rules: List[dict]) -> dict:
 
     for rule, raw_value in zip(relevant_rules, raw_values):
         db_field = rule["db_field"]
-        source_field = db_field.replace("_num", "_source").replace("_usd", "_usd_source")
-        date_field = db_field.replace("_num", "_date").replace("_usd", "_usd_date")
+        base_field = db_field
+        for suffix in ["_num", "_bool", "_text"]:
+            if base_field.endswith(suffix):
+                base_field = base_field[:-len(suffix)]
+                break
+        source_field = base_field + "_source"
+        date_field = base_field + "_date"
 
         # Fehler beim API-Call
         if isinstance(raw_value, Exception):

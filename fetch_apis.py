@@ -2,12 +2,12 @@
 fetch_apis.py – Generischer API Fetcher für GROUP B: FINANZEN
 FastAPI Router deployed on Railway.app
 
-Liest Regeln aus config_apis + Länderliste aus config_countries
+Liest Regeln aus config_apis + Länderliste aus config_rules (bewährt)
 Schreibt DIREKT in data_group_b_finanzen (kein Umweg über discovered_urls/WF2)
 Unterstützt: World Bank, BLS (USA)
 Erweiterbar für: Eurostat, EIA, College Scorecard
 
-v2.0.0 – 2026-03-08
+v2.1.0 – 2026-03-08
 """
 
 from fastapi import APIRouter
@@ -312,39 +312,75 @@ async def fetch_apis(request: FetchApisRequest):
     """
 
     # ==========================================================================
-    # 1. Länderliste aus config_countries holen
+    # 1. Länderliste aus config_rules holen (bewährt, keine Permission-Probleme)
+    #    + Mapping aus config_countries für worldbank_id / bls_available
     # ==========================================================================
     try:
+        # Distinct Länder aus config_rules
         if request.fetch_all_active:
-            countries_resp = supabase.table("config_countries").select(
-                "country_code, country_name, iso2, worldbank_id, eurostat_geo, bls_available"
+            rules_countries_resp = supabase.table("config_rules").select(
+                "country_name"
             ).eq("active", True).execute()
         elif request.country_codes:
-            countries_resp = supabase.table("config_countries").select(
-                "country_code, country_name, iso2, worldbank_id, eurostat_geo, bls_available"
-            ).in_("country_code", request.country_codes).eq("active", True).execute()
+            # country_codes = ISO2 Codes → als Präfix in rule_id suchen
+            rules_countries_resp = supabase.table("config_rules").select(
+                "country_name"
+            ).eq("active", True).execute()
         else:
             return {"success": False, "error": "Provide either 'country_codes' or 'fetch_all_active': true"}
 
-        countries = countries_resp.data
+        # Unique country_names
+        all_names = list({r["country_name"] for r in rules_countries_resp.data})
+
+        # Mapping: country_name → ISO code aus rule_id Präfix
+        # z.B. rule_id = 'US-COSTS' → country_code = 'US'
+        rules_resp_full = supabase.table("config_rules").select(
+            "rule_id, country_name"
+        ).eq("active", True).execute()
+
+        name_to_code = {}
+        for r in rules_resp_full.data:
+            rule_id = r["rule_id"]
+            country_name = r["country_name"]
+            if "-" in rule_id:
+                code = rule_id.split("-")[0]
+                name_to_code[country_name] = code
+
+        # Länder-Liste aufbauen
+        # BLS nur für US, worldbank_id = iso2 für alle
+        countries = []
+        for name in all_names:
+            code = name_to_code.get(name)
+            if not code:
+                continue
+            # Filter: wenn country_codes angegeben, nur diese
+            if request.country_codes and code not in request.country_codes:
+                continue
+            countries.append({
+                "country_code": code,
+                "country_name": name,
+                "iso2": code,
+                "worldbank_id": code,
+                "eurostat_geo": None,
+                "bls_available": code == "US"
+            })
+
         if not countries:
-            return {"success": False, "error": "Keine aktiven Länder gefunden in config_countries"}
+            return {"success": False, "error": "Keine aktiven Länder gefunden"}
 
         logger.info(f"📋 {len(countries)} Länder zu verarbeiten: {[c['country_code'] for c in countries]}")
 
     except Exception as e:
-        logger.error(f"❌ config_countries Abfrage fehlgeschlagen: {e}")
+        logger.error(f"❌ Länder-Abfrage fehlgeschlagen: {e}")
         return {"success": False, "error": str(e)}
 
     # ==========================================================================
     # 2. Alle aktiven API-Regeln aus config_apis holen
     # ==========================================================================
     try:
-        rules_resp = supabase.table("config_apis").select(
-            "api_id, country_iso, target_table, db_field, provider, series_id, source_label, transformation"
-        ).eq("active", True).eq("target_table", "data_group_b_finanzen").execute()
+        rules_resp = supabase.table("config_apis").select("*").eq("active", True).execute()
+        api_rules = [r for r in rules_resp.data if r.get("target_table") == "data_group_b_finanzen"]
 
-        api_rules = rules_resp.data
         if not api_rules:
             return {"success": False, "error": "Keine aktiven API-Regeln gefunden in config_apis"}
 

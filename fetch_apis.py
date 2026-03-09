@@ -37,17 +37,32 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Wendet die in config_apis hinterlegte Transformation auf den Rohwert an
 # =============================================================================
 
-def apply_transformation(value: float, transformation: str) -> Optional[float]:
+def apply_transformation(
+    value: float,
+    transformation: str,
+    multiplier_pct: Optional[float] = None,
+    offset_usd: Optional[float] = None
+) -> Optional[float]:
     """
-    Wendet eine Transformation auf einen Rohwert an.
-    Transformation-Strings kommen direkt aus config_apis.transformation
+    Flexible Transformation Engine:
+    1. Basis: raw_value / 12 (World Bank liefert Jahreswerte)
+    2. multiplier_pct anwenden (aus config_apis) – überschreibt alte transformation
+    3. offset_usd addieren (optional, NULL = kein Offset)
+    Fallback: wenn kein multiplier_pct → alte transformation Strings
     """
     if value is None:
         return None
 
     try:
-        t = transformation.strip().lower()
+        # Neue Logik: multiplier_pct aus DB verwenden
+        if multiplier_pct is not None:
+            result = (value / 12) * float(multiplier_pct)
+            if offset_usd is not None:
+                result += float(offset_usd)
+            return round(result, 2)
 
+        # Fallback: alte transformation Strings (Rückwärtskompatibilität)
+        t = (transformation or "").strip().lower()
         if t == "divide_by_12":
             return round(value / 12, 2)
         elif t == "divide_by_12_multiply_1.3":
@@ -61,8 +76,8 @@ def apply_transformation(value: float, transformation: str) -> Optional[float]:
         elif t == "none" or t == "":
             return round(value, 2)
         else:
-            logger.warning(f"⚠️ Unknown transformation: {transformation} – returning raw value")
-            return round(value, 2)
+            logger.warning(f"⚠️ Unknown transformation: {transformation} – using raw/12")
+            return round(value / 12, 2)
 
     except Exception as e:
         logger.error(f"❌ Transformation error ({transformation}): {e}")
@@ -259,7 +274,12 @@ async def process_country(country: dict, api_rules: List[dict]) -> dict:
             continue
 
         # Transformation anwenden
-        transformed_value = apply_transformation(raw_value, rule.get("transformation", "none"))
+        transformed_value = apply_transformation(
+            raw_value,
+            rule.get("transformation", "none"),
+            multiplier_pct=rule.get("multiplier_pct"),
+            offset_usd=rule.get("offset_usd")
+        )
 
         if transformed_value is not None:
             upsert_data[db_field] = transformed_value

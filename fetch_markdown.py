@@ -6,6 +6,12 @@ Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 Response format: { "data": "markdown..." }
 Compatible with existing Clean Markdown Code Node in n8n WF2
 
+v2.0.0 - Angepasst an Discovery API v2.0:
+  - httpx als Standard, Playwright nur Fallback (wie Discovery)
+  - Globaler httpx Client (Connection Pooling)
+  - PDF-Extraktion mit pymupdf (PDFs werden nicht mehr übersprungen)
+  - Retry-Logik bei Timeouts/Server-Fehlern
+
 v1.3.0 - Added /fetch-markdown-batch endpoint for parallel processing
 """
 
@@ -13,10 +19,13 @@ from fastapi import APIRouter, HTTPException, Query
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup, NavigableString
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import asyncio
+import httpx
 import logging
 import re
+import tempfile
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +36,43 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # =============================================================================
-# PDF DETECTION
+# CONFIG
+# =============================================================================
+
+MAX_RETRIES = 3
+RETRY_DELAYS = [1, 3, 5]
+
+# =============================================================================
+# GLOBALER HTTPX CLIENT (Connection Pooling – wie im Discovery Script)
+# =============================================================================
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Gibt den globalen httpx Client zurück."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=25,
+            follow_redirects=True,
+            limits=httpx.Limits(
+                max_connections=15,
+                max_keepalive_connections=10,
+            ),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+            }
+        )
+    return _http_client
+
+
+# =============================================================================
+# PDF DETECTION + EXTRACTION
 # =============================================================================
 
 def is_pdf_url(url: str) -> bool:
@@ -39,8 +84,187 @@ def is_pdf_url(url: str) -> bool:
         return True
     return False
 
+
+async def extract_pdf_text(url: str) -> Optional[str]:
+    """Lädt PDF herunter und extrahiert Text mit pymupdf.
+    Gibt None zurück wenn pymupdf nicht installiert oder PDF nicht lesbar.
+    """
+    try:
+        import fitz  # pymupdf
+    except ImportError:
+        logger.warning("⚠️ pymupdf nicht installiert – PDF-Extraktion nicht verfügbar")
+        return None
+
+    try:
+        client = await get_http_client()
+        r = await client.get(url)
+
+        if r.status_code != 200:
+            logger.warning(f"⚠️ PDF Download fehlgeschlagen: Status {r.status_code}")
+            return None
+
+        # PDF in temporäre Datei schreiben
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(r.content)
+            tmp_path = tmp.name
+
+        try:
+            doc = fitz.open(tmp_path)
+            text_parts = []
+            for page in doc:
+                text_parts.append(page.get_text())
+            doc.close()
+
+            full_text = "\n\n".join(text_parts).strip()
+
+            if len(full_text) < 50:
+                logger.info(f"📄 PDF hat kaum Text (vermutlich gescannt): {url}")
+                return None
+
+            return full_text
+
+        finally:
+            os.unlink(tmp_path)
+
+    except Exception as e:
+        logger.error(f"❌ PDF-Extraktion fehlgeschlagen für {url}: {str(e)}")
+        return None
+
+
+def pdf_text_to_markdown(text: str, url: str) -> str:
+    """Konvertiert extrahierten PDF-Text in einfaches Markdown."""
+    lines = text.split("\n")
+    md_lines = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            md_lines.append("")
+            continue
+
+        # Kurze Zeilen in Großbuchstaben → vermutlich Überschriften
+        if line.isupper() and len(line) < 100:
+            md_lines.append(f"\n## {line.title()}\n")
+        else:
+            md_lines.append(line)
+
+    markdown = "\n".join(md_lines)
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+    return markdown.strip()
+
+
 # =============================================================================
-# HTML → MARKDOWN CONVERSION
+# HTML FETCHING: HTTPX (schnell) + PLAYWRIGHT FALLBACK
+# =============================================================================
+
+async def fetch_html_fast(url: str) -> Optional[str]:
+    """Schneller HTML-Fetch mit httpx + Retry-Logik."""
+    client = await get_http_client()
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = await client.get(url)
+
+            # Content-Type prüfen
+            content_type = r.headers.get("content-type", "")
+            if "application/pdf" in content_type:
+                return None  # PDF wird separat behandelt
+
+            if r.status_code == 200:
+                return r.text
+            elif r.status_code in (429, 503, 502):
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAYS[attempt]
+                    logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} (Status {r.status_code})")
+                    await asyncio.sleep(delay)
+                    continue
+            else:
+                logger.warning(f"⚠️ httpx Status {r.status_code} für {url}")
+                return None
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            if attempt < MAX_RETRIES - 1:
+                delay = RETRY_DELAYS[attempt]
+                logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} ({type(e).__name__})")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                logger.warning(f"⚠️ httpx Fehler nach {MAX_RETRIES} Versuchen: {str(e)}")
+                return None
+        except Exception as e:
+            logger.warning(f"⚠️ httpx Fehler für {url}: {str(e)}")
+            return None
+
+    return None
+
+
+async def fetch_html_playwright(url: str) -> Optional[str]:
+    """Fallback: Playwright für JavaScript-lastige Seiten."""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=VizDisplayCompositor'
+                ]
+            )
+
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+            )
+
+            # Bilder/Tracking blockieren (wie vorher)
+            await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
+                               lambda route: route.abort())
+            await context.route("**/{analytics,tracking,ads,doubleclick}**",
+                               lambda route: route.abort())
+
+            page = await context.new_page()
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+            html = await page.content()
+            await browser.close()
+
+            return html
+
+    except Exception as e:
+        logger.error(f"❌ Playwright Fehler für {url}: {str(e)}")
+        return None
+
+
+def needs_javascript(html: str) -> bool:
+    """Erkennt ob die Seite JavaScript braucht um Content zu laden."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Hauptinhalt extrahieren
+    content = (
+        soup.find("main") or
+        soup.find("article") or
+        soup.find(id=re.compile(r"content|main", re.I)) or
+        soup.find(class_=re.compile(r"content|main|article", re.I))
+    )
+    text = content.get_text(" ", strip=True) if content else soup.get_text(" ", strip=True)
+
+    # Wenig Text + viele Scripts → braucht JS
+    script_count = len(soup.find_all("script"))
+    if len(text) < 200 and script_count > 5:
+        return True
+
+    # SPA-Frameworks erkennen
+    html_lower = html.lower()
+    spa_indicators = ["__next", "__nuxt", "react-root", "ng-app", "v-app", 'id="app"']
+    if len(text) < 200 and any(ind in html_lower for ind in spa_indicators):
+        return True
+
+    return False
+
+
+# =============================================================================
+# HTML → MARKDOWN CONVERSION (UNVERÄNDERT – n8n Kompatibilität)
 # =============================================================================
 
 def html_to_markdown(html: str, url: str = "") -> str:
@@ -169,8 +393,9 @@ def _convert_table(table_element) -> str:
 
     return "\n".join(markdown_rows) if markdown_rows else ""
 
+
 # =============================================================================
-# QUALITY SCORING
+# QUALITY SCORING (UNVERÄNDERT – n8n Kompatibilität)
 # =============================================================================
 
 def calculate_quality_score(markdown: str) -> dict:
@@ -218,76 +443,104 @@ def calculate_quality_score(markdown: str) -> dict:
 
     return details
 
+
 # =============================================================================
-# MAIN FETCH FUNCTION
+# MAIN FETCH FUNCTION (NEU: httpx → Playwright Fallback → PDF Support)
 # =============================================================================
 
 async def fetch_and_convert(url: str) -> dict:
+    """Holt eine URL und konvertiert sie zu Markdown.
+    Reihenfolge:
+      1. PDF? → PDF-Extraktion
+      2. httpx (schnell)
+      3. Braucht JS? → Playwright Fallback
+    Response-Format bleibt identisch für n8n Kompatibilität.
+    """
+
+    # ─── PDF Handling ───
     if is_pdf_url(url):
-        logger.warning(f"📄 PDF detected, skipping: {url}")
+        logger.info(f"📄 PDF erkannt, versuche Extraktion: {url}")
+        pdf_text = await extract_pdf_text(url)
+
+        if pdf_text:
+            markdown = pdf_text_to_markdown(pdf_text, url)
+            quality = calculate_quality_score(markdown)
+            logger.info(f"✅ PDF extrahiert: {url} → {quality['word_count']} Wörter")
+            return {
+                "data": markdown,
+                "url": url,
+                "content_type": "pdf",
+                "quality_score": quality["final_score"],
+                "quality_details": quality,
+                "success": True,
+                "error": None
+            }
+        else:
+            # pymupdf nicht installiert oder PDF nicht lesbar
+            logger.warning(f"⚠️ PDF-Extraktion fehlgeschlagen: {url}")
+            return {
+                "data": f"[PDF-Dokument – Text-Extraktion fehlgeschlagen]\nURL: {url}",
+                "url": url,
+                "content_type": "pdf",
+                "quality_score": 0,
+                "quality_details": {"quality_status": "pdf_extraction_failed", "word_count": 0},
+                "success": False,
+                "error": "PDF text extraction failed (pymupdf may not be installed)"
+            }
+
+    # ─── HTML Handling: httpx zuerst ───
+    logger.info(f"🌐 Fetching: {url}")
+    html = await fetch_html_fast(url)
+
+    # Content-Type Check: vielleicht ist es doch ein PDF (URL hatte kein .pdf)
+    if html is None:
+        # Prüfe ob es ein PDF via Content-Type war
+        try:
+            client = await get_http_client()
+            head_r = await client.head(url)
+            ct = head_r.headers.get("content-type", "")
+            if "application/pdf" in ct:
+                logger.info(f"📄 PDF via Content-Type erkannt: {url}")
+                pdf_text = await extract_pdf_text(url)
+                if pdf_text:
+                    markdown = pdf_text_to_markdown(pdf_text, url)
+                    quality = calculate_quality_score(markdown)
+                    return {
+                        "data": markdown,
+                        "url": url,
+                        "content_type": "pdf",
+                        "quality_score": quality["final_score"],
+                        "quality_details": quality,
+                        "success": True,
+                        "error": None
+                    }
+        except Exception:
+            pass
+
+    # Fallback: Playwright wenn httpx komplett fehlschlägt
+    if html is None:
+        logger.info(f"🔄 httpx fehlgeschlagen, versuche Playwright: {url}")
+        html = await fetch_html_playwright(url)
+
+    if html is None:
         return {
-            "data": f"[PDF-Dokument erkannt – direkte Extraktion nicht unterstützt]\nURL: {url}",
+            "data": f"[Seite konnte nicht geladen werden]\nURL: {url}",
             "url": url,
-            "content_type": "pdf",
+            "content_type": "error",
             "quality_score": 0,
-            "quality_details": {"quality_status": "pdf_skipped", "word_count": 0},
+            "quality_details": {"quality_status": "fetch_error", "word_count": 0},
             "success": False,
-            "error": "PDF detected - extraction not supported"
+            "error": "Both httpx and Playwright failed to fetch the page"
         }
 
-    logger.info(f"🌐 Fetching: {url}")
+    # ─── JS-Check: Playwright Fallback wenn nötig ───
+    if needs_javascript(html):
+        logger.info(f"🔄 JS-Seite erkannt, nutze Playwright: {url}")
+        pw_html = await fetch_html_playwright(url)
+        if pw_html:
+            html = pw_html
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=VizDisplayCompositor'
-            ]
-        )
-
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-        )
-
-        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
-                           lambda route: route.abort())
-        await context.route("**/{analytics,tracking,ads,doubleclick}**",
-                           lambda route: route.abort())
-
-        try:
-            page = await context.new_page()
-            response = await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-
-            content_type = ""
-            if response:
-                content_type = response.headers.get("content-type", "")
-
-            if "application/pdf" in content_type:
-                await browser.close()
-                return {
-                    "data": f"[PDF-Dokument erkannt via Content-Type]\nURL: {url}",
-                    "url": url,
-                    "content_type": "pdf",
-                    "quality_score": 0,
-                    "quality_details": {"quality_status": "pdf_skipped", "word_count": 0},
-                    "success": False,
-                    "error": "PDF detected via Content-Type"
-                }
-
-            await page.wait_for_timeout(1500)
-            html = await page.content()
-            await browser.close()
-
-        except Exception as e:
-            await browser.close()
-            logger.error(f"❌ Playwright error for {url}: {str(e)}")
-            raise
-
+    # ─── Markdown Konvertierung ───
     markdown = html_to_markdown(html, url)
     quality = calculate_quality_score(markdown)
 
@@ -303,8 +556,9 @@ async def fetch_and_convert(url: str) -> dict:
         "error": None
     }
 
+
 # =============================================================================
-# API ENDPOINTS
+# API ENDPOINTS (Response-Format UNVERÄNDERT für n8n Kompatibilität)
 # =============================================================================
 
 @router.get("/fetch-markdown")
@@ -335,7 +589,7 @@ async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetc
 
 
 # =============================================================================
-# NEU: BATCH ENDPOINT (3 URLs parallel)
+# BATCH ENDPOINT (Response-Format UNVERÄNDERT für n8n Kompatibilität)
 # =============================================================================
 
 class BatchRequest(BaseModel):
@@ -345,21 +599,11 @@ class BatchRequest(BaseModel):
 async def fetch_markdown_batch(request: BatchRequest):
     """
     BATCH ENDPOINT – bis zu 3 URLs parallel verarbeiten
-    
+
     POST /fetch-markdown-batch
     Body: { "urls": ["https://url1", "https://url2", "https://url3"] }
-    
-    Response:
-    {
-        "results": [
-            { "data": "...", "url": "...", "quality_score": 7, "success": true },
-            { "data": "...", "url": "...", "quality_score": 5, "success": true },
-            { "data": "...", "url": "...", "quality_score": 0, "success": false }
-        ],
-        "total": 3,
-        "successful": 2,
-        "failed": 1
-    }
+
+    Response-Format identisch zu v1.3.0
     """
 
     if not request.urls:

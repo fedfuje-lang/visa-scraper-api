@@ -9,3 +9,4 @@ beautifulsoup4==4.12.2
 lxml==4.9.3
 tldextract==5.1.1
 playwright==1.40.0
+pymupdf==1.23.8

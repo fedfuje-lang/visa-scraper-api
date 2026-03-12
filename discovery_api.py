@@ -17,6 +17,11 @@ v2.0.1 - Crawling-Engine Feinschliff
   - to_visit_set für Duplicate-Check (O(1) statt O(n) List Comprehension)
   - Retry-Logik (3 Versuche mit Backoff bei Timeout/429/503)
 
+v2.1.0 - Multilingual Fix
+  - is_relevant_path() aus Crawling-Filtern entfernt
+  - Funktioniert jetzt für alle Sprachen/Länder ohne Keyword-Anpassung
+  - Nur BLOCKED_PATH_PATTERNS blockt — WF1b/Gemini übernehmen Qualitätskontrolle
+
 v1.4.0 - fetch_worldbank replaced by fetch_apis (generic API fetcher)
 v1.3.0 - GROUP B excluded from Discovery (World Bank API handles GROUP B)
 v1.2.0 - Added /fetch-markdown endpoint (Jina replacement)
@@ -52,7 +57,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # CORS Middleware (für n8n)
@@ -101,7 +106,8 @@ IGNORED_QUERY_PARAMS = [
     "page", "p", "lang", "language", "locale",
 ]
 
-# URL-Pfade die NICHT gecrawlt werden (spart 80-95% unnötige Requests)
+# URL-Pfade die NICHT gecrawlt werden (spart unnötige Requests)
+# Sprachunabhängig — diese Pfade sind in allen Ländern gleich unbrauchbar
 BLOCKED_PATH_PATTERNS = [
     "/privacy", "/datenschutz", "/cookie", "/impressum", "/imprint",
     "/login", "/signin", "/signup", "/register", "/account",
@@ -121,25 +127,9 @@ BLOCKED_PATH_PATTERNS = [
     "#",
 ]
 
-# Relevante URL-Pfade die BEVORZUGT gecrawlt werden
-RELEVANT_PATH_KEYWORDS = [
-    "visa", "visum", "immigration", "einwanderung", "residence",
-    "aufenthalt", "permit", "genehmigung", "migrate", "migration",
-    "foreign", "ausland", "expat", "work-permit", "arbeitserlaubnis",
-    "study", "studium", "student", "citizen", "staatsbürger",
-    "naturalization", "einbürgerung", "asylum", "asyl", "refugee",
-    "green-card", "settlement", "niederlassung", "entry", "einreise",
-    "travel", "reise", "consular", "konsular", "embassy", "botschaft",
-    "registration", "anmeldung", "register", "document", "dokument",
-    "certificate", "bescheinigung", "passport", "reisepass",
-    "education", "bildung", "school", "schule", "university", "universität",
-    "tuition", "gebühr", "scholarship", "stipendium", "admission", "zulassung",
-    "driver", "führerschein", "insurance", "versicherung",
-    "tax", "steuer", "social-security", "sozialversicherung",
-    "how-to", "guide", "ratgeber", "information", "faq",
-    "requirement", "voraussetzung", "application", "antrag",
-    "service", "dienstleistung",
-]
+# NOTE: is_relevant_path() wird nicht mehr als Filter verwendet (v2.1.0)
+# Grund: englische Keywords blockierten nicht-englische URLs (DE, ES, FR, etc.)
+# Qualitätskontrolle übernehmen WF1b (quality_score) und WF2 (Gemini)
 
 # =============================================================================
 # KEYWORDS CONFIG (nur noch A, E, F) — UNVERÄNDERT
@@ -198,7 +188,7 @@ GENERAL_KEYWORDS = [
 
 
 # =============================================================================
-# HELPER FUNCTIONS (VERBESSERT)
+# HELPER FUNCTIONS
 # =============================================================================
 
 def normalize_url(url: str) -> str:
@@ -239,34 +229,8 @@ def is_blocked_path(url: str) -> bool:
     return any(blocked in path_lower for blocked in BLOCKED_PATH_PATTERNS)
 
 
-def is_relevant_path(url: str) -> bool:
-    """Prüft ob der URL-Pfad relevant genug ist um gecrawlt zu werden.
-    Lockerer Filter: erlaubt kurze Pfade, Keyword-Matches und
-    Pfade mit Zahlen (oft Visa-Kategorien, Formular-Nummern, Subclasses).
-    """
-    path = urlparse(url).path.lower()
-
-    segments = [s for s in path.split("/") if s]
-
-    # Kurze Pfade (bis 2 Segmente) immer erlauben — Hauptkategorien
-    if len(segments) <= 2:
-        return True
-
-    # Keyword Match
-    if any(kw in path for kw in RELEVANT_PATH_KEYWORDS):
-        return True
-
-    # Zahlen im Pfad → oft Visa-Subclasses, Formular-Nummern, Programm-IDs
-    # z.B. /subclass-189, /form-47, /program-2024
-    if any(segment for segment in segments if any(c.isdigit() for c in segment)):
-        return True
-
-    return False
-
-
 def extract_main_content(soup: BeautifulSoup) -> str:
     """Extrahiert nur den Hauptinhalt der Seite (nicht Navigation/Footer/Sidebar)."""
-    # Versuche zuerst spezifische Content-Container zu finden
     content = soup.select_one(
         "main, "
         "article, "
@@ -277,11 +241,9 @@ def extract_main_content(soup: BeautifulSoup) -> str:
     )
 
     if content:
-        # Innerhalb des Content-Containers: Navigation etc. entfernen
         for tag in content.select("nav, footer, header, aside, .sidebar, .menu, .nav, .breadcrumb"):
             tag.decompose()
         text = content.get_text(" ", strip=True)
-        # Nur verwenden wenn genug Text vorhanden
         if len(text) > 100:
             return text
 
@@ -293,7 +255,7 @@ def extract_main_content(soup: BeautifulSoup) -> str:
 
 
 def score_url(url: str, text: str, target_group: str) -> int:
-    """Relevanz-Score berechnen (verbessert: URL-Pfad stärker gewichtet)."""
+    """Relevanz-Score berechnen (URL-Pfad stärker gewichtet)."""
     score = 0
     url_lower = url.lower()
     text_lower = text.lower()
@@ -306,7 +268,7 @@ def score_url(url: str, text: str, target_group: str) -> int:
     if target_group in GROUP_KEYWORDS:
         group_kws = GROUP_KEYWORDS[target_group]
 
-        # URL-Pfad Keywords (höchstes Gewicht — Pfad ist stärkster Indikator)
+        # URL-Pfad Keywords (höchstes Gewicht)
         path_matches = sum(1 for kw in group_kws if kw in path_lower)
         score += min(path_matches * 3, 6)
 
@@ -330,7 +292,7 @@ def score_url(url: str, text: str, target_group: str) -> int:
 
 
 def extract_topics(text: str, url: str, target_group: str) -> List[str]:
-    """Extrahiert Topics aus Text und URL — UNVERÄNDERT."""
+    """Extrahiert Topics aus Text und URL."""
     topics = []
     text_lower = text.lower()
     url_lower = url.lower()
@@ -369,13 +331,11 @@ def extract_topics(text: str, url: str, target_group: str) -> List[str]:
 
 
 # =============================================================================
-# NEU: SITEMAP PARSER
+# SITEMAP PARSER
 # =============================================================================
 
 async def fetch_sitemap_urls(base_url: str) -> List[str]:
-    """Versucht /sitemap.xml zu laden und gibt alle URLs zurück.
-    Unterstützt auch Sitemap-Indexes (sitemap of sitemaps).
-    """
+    """Versucht /sitemap.xml zu laden und gibt alle URLs zurück."""
     sitemap_url = urljoin(base_url, "/sitemap.xml")
     urls = []
 
@@ -391,16 +351,14 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
 
         root = ET.fromstring(r.text)
 
-        # Namespace handling (sitemaps haben oft xmlns)
         ns = ""
         if root.tag.startswith("{"):
             ns = root.tag.split("}")[0] + "}"
 
-        # Prüfe ob es ein Sitemap-Index ist
         sitemaps = root.findall(f".//{ns}sitemap/{ns}loc")
         if sitemaps:
             logger.info(f"📋 Sitemap-Index gefunden mit {len(sitemaps)} Sub-Sitemaps")
-            for sitemap_loc in sitemaps[:5]:  # Max 5 Sub-Sitemaps
+            for sitemap_loc in sitemaps[:5]:
                 sub_url = sitemap_loc.text.strip()
                 try:
                     sub_r = await client.get(sub_url, headers={
@@ -417,7 +375,6 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
                 except Exception:
                     continue
         else:
-            # Normale Sitemap
             for loc in root.findall(f".//{ns}loc"):
                 if loc.text:
                     urls.append(loc.text.strip())
@@ -431,15 +388,14 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
 
 
 # =============================================================================
-# NEU: GLOBALER HTTPX CLIENT (Connection Pooling)
+# GLOBALER HTTPX CLIENT (Connection Pooling)
 # =============================================================================
 
-# Ein Client für alle Requests → wiederverwendet TCP-Verbindungen
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 async def get_http_client() -> httpx.AsyncClient:
-    """Gibt den globalen httpx Client zurück (erstellt ihn beim ersten Aufruf)."""
+    """Gibt den globalen httpx Client zurück."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
@@ -461,9 +417,7 @@ async def get_http_client() -> httpx.AsyncClient:
 
 
 async def fetch_html_fast(url: str) -> Optional[str]:
-    """Schneller HTML-Fetch mit httpx + Retry-Logik.
-    Versucht bis zu MAX_RETRIES Mal mit steigender Wartezeit.
-    """
+    """Schneller HTML-Fetch mit httpx + Retry-Logik."""
     client = await get_http_client()
 
     for attempt in range(MAX_RETRIES):
@@ -472,7 +426,6 @@ async def fetch_html_fast(url: str) -> Optional[str]:
             if r.status_code == 200:
                 return r.text
             elif r.status_code in (429, 503, 502):
-                # Rate Limit oder Server überlastet → Retry
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_DELAYS[attempt]
                     logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} (Status {r.status_code}, warte {delay}s)")
@@ -515,12 +468,10 @@ def needs_javascript(html: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
     text = extract_main_content(soup)
 
-    # Wenn kaum Text vorhanden aber viele Script-Tags → braucht JS
     script_count = len(soup.find_all("script"))
     if len(text) < 200 and script_count > 5:
         return True
 
-    # Typische SPA-Frameworks erkennen
     html_lower = html.lower()
     spa_indicators = ["__next", "__nuxt", "react-root", "ng-app", "v-app", "id=\"app\""]
     if len(text) < 200 and any(ind in html_lower for ind in spa_indicators):
@@ -530,7 +481,7 @@ def needs_javascript(html: str) -> bool:
 
 
 # =============================================================================
-# MAIN DISCOVERY FUNCTION (OPTIMIERT)
+# MAIN DISCOVERY FUNCTION
 # =============================================================================
 
 async def discover_urls(rule: Dict) -> List[Dict]:
@@ -544,10 +495,8 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     visited = set()
     discovered_urls = []
 
-    # Semaphore für paralleles Crawling
     semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
 
-    # Playwright Browser (nur bei Bedarf gestartet)
     playwright_instance = None
     playwright_browser = None
 
@@ -557,12 +506,12 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     # ─── SCHRITT 1: Sitemap checken ───
     sitemap_urls = await fetch_sitemap_urls(start_url)
 
-    # Sitemap-URLs filtern: nur interne + relevante Pfade
+    # Sitemap-URLs filtern: nur interne + nicht blockierte Pfade
+    # is_relevant_path() NICHT mehr verwendet (v2.1.0 — multilingual fix)
     if sitemap_urls:
         sitemap_filtered = [
             u for u in sitemap_urls
             if is_internal(u, base_domain)
-            and is_relevant_path(u)
             and not is_blocked_path(u)
         ]
         logger.info(f"📋 Sitemap: {len(sitemap_filtered)} relevante URLs (von {len(sitemap_urls)} total)")
@@ -570,10 +519,8 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         sitemap_filtered = []
 
     # ─── SCHRITT 2: Crawl-Queue aufbauen ───
-    # Sitemap-URLs haben Priorität (depth=0), dann die Start-URL
-    # deque für O(1) popleft statt O(n) list.pop(0)
     to_visit = deque()
-    to_visit_set = set()  # Schneller Duplicate-Check statt List Comprehension
+    to_visit_set = set()
 
     for sm_url in sitemap_filtered[:max_pages]:
         normalized_sm = normalize_url(sm_url)
@@ -581,7 +528,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             to_visit.append((normalized_sm, 0))
             to_visit_set.add(normalized_sm)
 
-    # Start-URL auch hinzufügen falls nicht schon drin
     normalized_start = normalize_url(start_url)
     if normalized_start not in to_visit_set:
         to_visit.appendleft((normalized_start, 0))
@@ -594,10 +540,8 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         nonlocal playwright_instance, playwright_browser
 
         async with semaphore:
-            # Schneller Fetch mit httpx
             html = await fetch_html_fast(url)
 
-            # Fallback: Playwright wenn JS benötigt
             if html and needs_javascript(html):
                 logger.info(f"🔄 JS-Seite erkannt, nutze Playwright: {url}")
                 if not playwright_browser:
@@ -632,10 +576,10 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                         continue
                     normalized_full = normalize_url(full_url)
 
-                    # Filter: intern + relevant + nicht blockiert
+                    # Filter: intern + nicht blockiert
+                    # is_relevant_path() NICHT mehr verwendet (v2.1.0 — multilingual fix)
                     if (is_internal(normalized_full, base_domain)
-                            and not is_blocked_path(normalized_full)
-                            and is_relevant_path(normalized_full)):
+                            and not is_blocked_path(normalized_full)):
                         child_links.append(normalized_full)
 
             result = None
@@ -657,7 +601,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
     # Crawling Loop: Batch-weise parallel
     while to_visit and len(visited) < max_pages:
-        # Nächsten Batch vorbereiten (max CONCURRENT_LIMIT Seiten)
         batch = []
         while to_visit and len(batch) < CONCURRENT_LIMIT:
             url, depth = to_visit.popleft()
@@ -673,7 +616,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
         logger.info(f"🔎 Batch: {len(batch)} Seiten parallel (gesamt: {len(visited)}/{max_pages})")
 
-        # Parallel verarbeiten
         tasks = [process_page(url, depth) for url, depth in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -687,7 +629,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             if url_data:
                 discovered_urls.append(url_data)
 
-            # Neue Links zur Queue hinzufügen
             for link in child_links:
                 if link not in visited and link not in to_visit_set and len(visited) + len(to_visit) < max_pages * 2:
                     to_visit.append((link, depth + 1))
@@ -704,7 +645,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
 
 # =============================================================================
-# SUPABASE FUNCTIONS — UNVERÄNDERT
+# SUPABASE FUNCTIONS
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
@@ -764,7 +705,7 @@ def update_last_crawled(rule_id: str):
 
 
 # =============================================================================
-# API ENDPOINTS — UNVERÄNDERT (gleiche Interfaces für n8n)
+# API ENDPOINTS
 # =============================================================================
 
 class DiscoveryRequest(BaseModel):
@@ -800,12 +741,12 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "status": "running",
         "improvements": [
             "httpx + Playwright fallback (10x faster)",
             "Parallel crawling (10 concurrent)",
-            "URL path filtering (80-95% less noise)",
+            "Multilingual URL filtering (v2.1.0 — no more keyword blocking)",
             "Sitemap parser (finds URLs instantly)",
             "Smart content extraction (main/article only)",
             "Better URL normalization (no utm/tracking params)"
@@ -825,7 +766,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -846,7 +787,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
         )
 
     logger.info("=" * 80)
-    logger.info("🚀 DIRECT DISCOVERY STARTED (v2.0.0 – Optimized)")
+    logger.info("🚀 DIRECT DISCOVERY STARTED (v2.1.0 – Multilingual)")
     logger.info(f"📋 Country: {request.country_name} ({request.country_code})")
     logger.info(f"📂 Group: {request.target_group}")
     logger.info(f"🔗 Start URLs: {len(request.start_urls)}")
@@ -891,7 +832,7 @@ async def run_discovery(request: DiscoveryRequest):
     """
 
     logger.info("=" * 80)
-    logger.info("🚀 DISCOVERY API STARTED (v2.0.0 – Optimized Crawling)")
+    logger.info("🚀 DISCOVERY API STARTED (v2.1.0 – Multilingual Crawling)")
     logger.info(f"📋 Request: {request.dict()}")
     logger.info("=" * 80)
 
@@ -993,13 +934,14 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.0.0 (Optimized)...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.1.0 (Multilingual)...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info(f"🔄 Retry: {MAX_RETRIES}x mit Delays {RETRY_DELAYS}s")
     logger.info("✅ API is ready!")
     logger.info("📍 Endpoints: /, /health, /discover, /discover-direct, /fetch-markdown, /fetch-markdown-batch, /fetch-apis")
     logger.info("⚠️  GROUP B: FINANZEN excluded from discovery – use /fetch-apis")
+    logger.info("🌍 v2.1.0: Multilingual fix – is_relevant_path() removed from crawl filters")
 
 
 @app.on_event("shutdown")

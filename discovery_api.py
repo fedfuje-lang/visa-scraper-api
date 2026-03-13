@@ -22,6 +22,14 @@ v2.1.0 - Multilingual Fix
   - Funktioniert jetzt für alle Sprachen/Länder ohne Keyword-Anpassung
   - Nur BLOCKED_PATH_PATTERNS blockt — WF1b/Gemini übernehmen Qualitätskontrolle
 
+v2.2.0 - Dynamic Keywords
+  - Keywords aus Supabase config_keywords Tabelle (ALL + länderspezifisch)
+  - Cache-Key (country_iso, target_group) — kein Mix zwischen Gruppen
+  - priority_weight (1-5) ersetzt fixe Gewichtung
+  - is_negative dämpft Score subtraktiv (nicht blockend, min 1)
+  - match_type ('url', 'content', 'both') steuert Suchbereich
+  - GROUP_KEYWORDS bleibt als Fallback falls Supabase-Abfrage fehlschlägt
+
 v1.4.0 - fetch_worldbank replaced by fetch_apis (generic API fetcher)
 v1.3.0 - GROUP B excluded from Discovery (World Bank API handles GROUP B)
 v1.2.0 - Added /fetch-markdown endpoint (Jina replacement)
@@ -39,7 +47,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 import os
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 import logging
 import xml.etree.ElementTree as ET
 
@@ -57,7 +65,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 # CORS Middleware (für n8n)
@@ -132,7 +140,8 @@ BLOCKED_PATH_PATTERNS = [
 # Qualitätskontrolle übernehmen WF1b (quality_score) und WF2 (Gemini)
 
 # =============================================================================
-# KEYWORDS CONFIG (nur noch A, E, F) — UNVERÄNDERT
+# FALLBACK KEYWORDS — unverändert aus v2.1.0
+# Nur aktiv wenn load_keywords() fehlschlägt (Supabase nicht erreichbar etc.)
 # =============================================================================
 
 GROUP_KEYWORDS = {
@@ -186,16 +195,89 @@ GENERAL_KEYWORDS = [
     "information", "guide", "how to", "requirements", "process", "procedure"
 ]
 
+# =============================================================================
+# ÄNDERUNG 1/3: KEYWORD CACHE + load_keywords()
+# Cache-Key: (country_iso, target_group) — verhindert Mix zwischen Gruppen
+# =============================================================================
+
+_keywords_cache: Dict[Tuple[str, str], Dict] = {}
+
+
+async def load_keywords(country_iso: str, target_group: str) -> Optional[Dict]:
+    """
+    Lädt Keywords aus config_keywords für ein Land + Gruppe.
+    Kombiniert 'ALL' (globale Basis) + länderspezifische Keywords.
+
+    Cache-Key: (country_iso, target_group)
+    → DE/GROUP A und DE/GROUP E werden getrennt gecacht — kein Keyword-Mix.
+    → Innerhalb eines Discovery-Runs wird jede Kombination nur einmal geladen.
+
+    Gibt None zurück wenn Supabase fehlschlägt → score_url() nutzt Fallback.
+    """
+    cache_key = (country_iso, target_group)
+
+    if cache_key in _keywords_cache:
+        return _keywords_cache[cache_key]
+
+    try:
+        response = supabase.table("config_keywords").select(
+            "keyword, priority_weight, is_negative, match_type"
+        ).eq("target_group", target_group).in_(
+            "country_iso", ["ALL", country_iso]
+        ).execute()
+
+        if not response.data:
+            logger.warning(
+                f"⚠️ Keine Keywords in config_keywords für "
+                f"({country_iso}, {target_group}) — Fallback aktiv"
+            )
+            return None
+
+        positive = []
+        negative = []
+
+        for row in response.data:
+            entry = {
+                "keyword":    row["keyword"],
+                "weight":     row["priority_weight"],
+                "match_type": row["match_type"],
+            }
+            if row["is_negative"]:
+                negative.append(entry)
+            else:
+                positive.append(entry)
+
+        result = {"positive": positive, "negative": negative}
+        _keywords_cache[cache_key] = result
+
+        logger.info(
+            f"📚 Keywords geladen ({country_iso}, {target_group}): "
+            f"{len(positive)} positiv, {len(negative)} negativ"
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(
+            f"⚠️ config_keywords Abfrage fehlgeschlagen "
+            f"({country_iso}, {target_group}): {e} — Fallback aktiv"
+        )
+        return None
+
+
+def clear_keywords_cache():
+    """Cache leeren — einmal pro /discover Aufruf."""
+    global _keywords_cache
+    _keywords_cache = {}
+
 
 # =============================================================================
-# HELPER FUNCTIONS
+# HELPER FUNCTIONS — unverändert aus v2.1.0
 # =============================================================================
 
 def normalize_url(url: str) -> str:
     """Normalisiert URL: entfernt Fragment UND unnötige Query-Parameter."""
     parsed = urlparse(url)
 
-    # Query-Parameter filtern
     if parsed.query:
         params = parse_qs(parsed.query, keep_blank_values=True)
         filtered = {
@@ -206,9 +288,7 @@ def normalize_url(url: str) -> str:
     else:
         clean_query = ""
 
-    # Trailing slash normalisieren
     path = parsed.path.rstrip("/") if parsed.path != "/" else "/"
-
     normalized = parsed._replace(fragment="", query=clean_query, path=path).geturl()
     return normalized
 
@@ -247,40 +327,89 @@ def extract_main_content(soup: BeautifulSoup) -> str:
         if len(text) > 100:
             return text
 
-    # Fallback: ganze Seite, aber Navigation/Footer etc. entfernen
     for tag in soup.select("nav, footer, header, aside, .sidebar, .menu, .nav, .breadcrumb, .cookie, script, style"):
         tag.decompose()
 
     return soup.get_text(" ", strip=True)
 
 
-def score_url(url: str, text: str, target_group: str) -> int:
-    """Relevanz-Score berechnen (URL-Pfad stärker gewichtet)."""
+# =============================================================================
+# ÄNDERUNG 2/3: score_url() — nimmt keywords_config Parameter
+# Fallback auf GROUP_KEYWORDS wenn keywords_config=None
+# =============================================================================
+
+def score_url(url: str, text: str, target_group: str,
+              keywords_config: Optional[Dict] = None) -> int:
+    """
+    Relevanz-Score berechnen.
+
+    v2.2.0: Nutzt keywords_config aus config_keywords wenn übergeben.
+    - priority_weight (1-5): Punkte pro Treffer
+    - URL-Pfad Treffer: weight * 2 (wie bisher stärker gewichtet)
+    - URL-Domain Treffer: weight * 1
+    - Content Treffer: weight * 1
+    - is_negative: subtrahiert weight (dämpft, blockiert nicht)
+    - match_type 'url': nur URL prüfen
+    - match_type 'content': nur Text prüfen
+    - match_type 'both': beide prüfen
+
+    Fallback: GROUP_KEYWORDS mit v2.1.0 Logik wenn keywords_config=None.
+    Score bleibt immer zwischen 1 und 10.
+    """
     score = 0
     url_lower = url.lower()
     text_lower = text.lower()
     path_lower = urlparse(url).path.lower()
 
-    # General Keywords
+    # General Keywords — unverändert, sprachunabhängige Basis
     general_matches = sum(1 for kw in GENERAL_KEYWORDS if kw in url_lower or kw in text_lower)
     score += min(general_matches, 2)
 
-    if target_group in GROUP_KEYWORDS:
-        group_kws = GROUP_KEYWORDS[target_group]
+    if keywords_config is not None:
+        # ── Neue Logik v2.2.0: config_keywords ───────────────────
+        for entry in keywords_config["positive"]:
+            kw         = entry["keyword"]
+            weight     = entry["weight"]
+            match_type = entry["match_type"]
 
-        # URL-Pfad Keywords (höchstes Gewicht)
-        path_matches = sum(1 for kw in group_kws if kw in path_lower)
-        score += min(path_matches * 3, 6)
+            if match_type in ("url", "both"):
+                if kw in path_lower:
+                    score += weight * 2      # Pfad-Treffer: doppelt gewichtet
+                elif kw in url_lower:
+                    score += weight          # Domain/Query-Treffer: einfach
 
-        # URL komplett (inkl. Domain)
-        url_matches = sum(1 for kw in group_kws if kw in url_lower and kw not in path_lower)
-        score += min(url_matches, 2)
+            if match_type in ("content", "both"):
+                if kw in text_lower:
+                    score += weight
 
-        # Text-Inhalt
-        text_matches = sum(1 for kw in group_kws if kw in text_lower)
-        score += min(text_matches, 4)
+        for entry in keywords_config["negative"]:
+            kw         = entry["keyword"]
+            weight     = entry["weight"]
+            match_type = entry["match_type"]
 
-    # Text-Länge Bonus
+            hit = False
+            if match_type in ("url", "both") and kw in url_lower:
+                hit = True
+            if match_type in ("content", "both") and kw in text_lower:
+                hit = True
+            if hit:
+                score -= weight              # Dämpfen, nicht blocken
+
+    else:
+        # ── Fallback: GROUP_KEYWORDS v2.1.0 Logik ────────────────
+        if target_group in GROUP_KEYWORDS:
+            group_kws = GROUP_KEYWORDS[target_group]
+
+            path_matches = sum(1 for kw in group_kws if kw in path_lower)
+            score += min(path_matches * 3, 6)
+
+            url_matches = sum(1 for kw in group_kws if kw in url_lower and kw not in path_lower)
+            score += min(url_matches, 2)
+
+            text_matches = sum(1 for kw in group_kws if kw in text_lower)
+            score += min(text_matches, 4)
+
+    # Text-Länge Bonus — unverändert
     if len(text) > 3000:
         score += 2
     elif len(text) > 1500:
@@ -331,7 +460,7 @@ def extract_topics(text: str, url: str, target_group: str) -> List[str]:
 
 
 # =============================================================================
-# SITEMAP PARSER
+# SITEMAP PARSER — unverändert aus v2.1.0
 # =============================================================================
 
 async def fetch_sitemap_urls(base_url: str) -> List[str]:
@@ -388,7 +517,7 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
 
 
 # =============================================================================
-# GLOBALER HTTPX CLIENT (Connection Pooling)
+# GLOBALER HTTPX CLIENT — unverändert aus v2.1.0
 # =============================================================================
 
 _http_client: Optional[httpx.AsyncClient] = None
@@ -482,12 +611,15 @@ def needs_javascript(html: str) -> bool:
 
 # =============================================================================
 # MAIN DISCOVERY FUNCTION
+# ÄNDERUNG 3/3: load_keywords() einmal pro Rule aufrufen, an score_url() übergeben
 # =============================================================================
 
 async def discover_urls(rule: Dict) -> List[Dict]:
-    start_url = rule['target_url']
-    max_pages = rule['max_urls']
-    max_depth = rule['max_depth']
+    start_url    = rule['target_url']
+    max_pages    = rule['max_urls']
+    max_depth    = rule['max_depth']
+    country_iso  = rule['country_iso']
+    target_group = rule['target_group']
 
     ext = tldextract.extract(start_url)
     base_domain = f"{ext.domain}.{ext.suffix}"
@@ -503,11 +635,12 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
     logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
 
+    # v2.2.0: Keywords einmal pro Rule laden (gecacht nach country_iso + target_group)
+    keywords_config = await load_keywords(country_iso, target_group)
+
     # ─── SCHRITT 1: Sitemap checken ───
     sitemap_urls = await fetch_sitemap_urls(start_url)
 
-    # Sitemap-URLs filtern: nur interne + nicht blockierte Pfade
-    # is_relevant_path() NICHT mehr verwendet (v2.1.0 — multilingual fix)
     if sitemap_urls:
         sitemap_filtered = [
             u for u in sitemap_urls
@@ -561,8 +694,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             title_tag = soup.find("title")
             page_title = title_tag.get_text(strip=True) if title_tag else ""
 
-            relevance = score_url(url, text, rule['target_group'])
-            topics = extract_topics(text, url, rule['target_group'])
+            # v2.2.0: keywords_config übergeben
+            relevance = score_url(url, text, target_group, keywords_config)
+            topics = extract_topics(text, url, target_group)
 
             # Links für weitere Crawling-Runden sammeln
             child_links = []
@@ -599,7 +733,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
             return url, depth, result, text, child_links, topics
 
-    # Crawling Loop: Batch-weise parallel
+    # Crawling Loop: Batch-weise parallel — unverändert
     while to_visit and len(visited) < max_pages:
         batch = []
         while to_visit and len(batch) < CONCURRENT_LIMIT:
@@ -645,7 +779,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
 
 # =============================================================================
-# SUPABASE FUNCTIONS
+# SUPABASE FUNCTIONS — unverändert aus v2.1.0
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
@@ -705,7 +839,7 @@ def update_last_crawled(rule_id: str):
 
 
 # =============================================================================
-# API ENDPOINTS
+# API ENDPOINTS — unverändert aus v2.1.0 (n8n Kompatibilität)
 # =============================================================================
 
 class DiscoveryRequest(BaseModel):
@@ -741,7 +875,7 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "status": "running",
         "improvements": [
             "httpx + Playwright fallback (10x faster)",
@@ -749,7 +883,9 @@ async def root():
             "Multilingual URL filtering (v2.1.0 — no more keyword blocking)",
             "Sitemap parser (finds URLs instantly)",
             "Smart content extraction (main/article only)",
-            "Better URL normalization (no utm/tracking params)"
+            "Better URL normalization (no utm/tracking params)",
+            "Dynamic keywords from Supabase config_keywords (v2.2.0)",
+            "priority_weight scoring + negative keyword dampening (v2.2.0)",
         ],
         "endpoints": {
             "discover": "/discover (GROUP A, E, F only – GROUP B via fetch-apis)",
@@ -766,7 +902,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -786,8 +922,10 @@ async def discover_direct(request: DirectDiscoveryRequest):
             urls=[]
         )
 
+    clear_keywords_cache()
+
     logger.info("=" * 80)
-    logger.info("🚀 DIRECT DISCOVERY STARTED (v2.1.0 – Multilingual)")
+    logger.info("🚀 DIRECT DISCOVERY STARTED (v2.2.0 – Dynamic Keywords)")
     logger.info(f"📋 Country: {request.country_name} ({request.country_code})")
     logger.info(f"📂 Group: {request.target_group}")
     logger.info(f"🔗 Start URLs: {len(request.start_urls)}")
@@ -798,11 +936,11 @@ async def discover_direct(request: DirectDiscoveryRequest):
     try:
         for i, start_url in enumerate(request.start_urls, 1):
             rule = {
-                'target_url': start_url,
-                'max_urls': request.max_urls,
-                'max_depth': request.max_depth,
-                'rule_id': request.rule_id,
-                'country_iso': request.country_code,
+                'target_url':   start_url,
+                'max_urls':     request.max_urls,
+                'max_depth':    request.max_depth,
+                'rule_id':      request.rule_id,
+                'country_iso':  request.country_code,
                 'country_name': request.country_name,
                 'target_group': request.target_group
             }
@@ -831,8 +969,10 @@ async def run_discovery(request: DiscoveryRequest):
     GROUP B: FINANZEN wird automatisch übersprungen – fetch-apis übernimmt
     """
 
+    clear_keywords_cache()
+
     logger.info("=" * 80)
-    logger.info("🚀 DISCOVERY API STARTED (v2.1.0 – Multilingual Crawling)")
+    logger.info("🚀 DISCOVERY API STARTED (v2.2.0 – Dynamic Keywords)")
     logger.info(f"📋 Request: {request.dict()}")
     logger.info("=" * 80)
 
@@ -892,22 +1032,22 @@ async def run_discovery(request: DiscoveryRequest):
 
                 total_urls_found += saved_count
                 results_per_rule.append({
-                    "rule_id": rule['rule_id'],
-                    "country": rule['country_name'],
+                    "rule_id":      rule['rule_id'],
+                    "country":      rule['country_name'],
                     "target_group": rule['target_group'],
-                    "urls_found": saved_count,
-                    "success": True
+                    "urls_found":   saved_count,
+                    "success":      True
                 })
 
             except Exception as e:
                 logger.error(f"❌ Error processing rule {rule['rule_id']}: {str(e)}")
                 results_per_rule.append({
-                    "rule_id": rule['rule_id'],
-                    "country": rule['country_name'],
+                    "rule_id":      rule['rule_id'],
+                    "country":      rule['country_name'],
                     "target_group": rule.get('target_group', 'unknown'),
-                    "urls_found": 0,
-                    "success": False,
-                    "error": str(e)
+                    "urls_found":   0,
+                    "success":      False,
+                    "error":        str(e)
                 })
 
         logger.info(f"\n{'=' * 80}")
@@ -929,12 +1069,12 @@ async def run_discovery(request: DiscoveryRequest):
 
 
 # =============================================================================
-# STARTUP
+# STARTUP / SHUTDOWN — unverändert aus v2.1.0
 # =============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.1.0 (Multilingual)...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.2.0 (Dynamic Keywords)...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info(f"🔄 Retry: {MAX_RETRIES}x mit Delays {RETRY_DELAYS}s")
@@ -942,6 +1082,7 @@ async def startup_event():
     logger.info("📍 Endpoints: /, /health, /discover, /discover-direct, /fetch-markdown, /fetch-markdown-batch, /fetch-apis")
     logger.info("⚠️  GROUP B: FINANZEN excluded from discovery – use /fetch-apis")
     logger.info("🌍 v2.1.0: Multilingual fix – is_relevant_path() removed from crawl filters")
+    logger.info("📚 v2.2.0: Dynamic keywords – config_keywords Tabelle, priority_weight, negative dampening")
 
 
 @app.on_event("shutdown")

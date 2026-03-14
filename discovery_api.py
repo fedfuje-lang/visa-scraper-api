@@ -22,6 +22,11 @@ v2.1.0 - Multilingual Fix
   - Funktioniert jetzt für alle Sprachen/Länder ohne Keyword-Anpassung
   - Nur BLOCKED_PATH_PATTERNS blockt — WF1b/Gemini übernehmen Qualitätskontrolle
 
+v2.3.0 - Smarter JS Detection
+  - Playwright wird auch getriggert wenn httpx HTML liefert aber 0 interne Links findet
+  - Verhindert stille Ausfälle bei SPAs die genug HTML rendern um needs_javascript() zu täuschen
+  - Kein manuelles Flag nötig — universell für alle Länder
+
 v2.2.0 - Dynamic Keywords
   - Keywords aus Supabase config_keywords Tabelle (ALL + länderspezifisch)
   - Cache-Key (country_iso, target_group) — kein Mix zwischen Gruppen
@@ -65,7 +70,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 # CORS Middleware (für n8n)
@@ -675,8 +680,22 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         async with semaphore:
             html = await fetch_html_fast(url)
 
-            if html and needs_javascript(html):
-                logger.info(f"🔄 JS-Seite erkannt, nutze Playwright: {url}")
+            # v2.3.0: Playwright wenn needs_javascript() ODER wenn httpx 0 interne Links liefert
+            # Zweite Bedingung fängt SPAs die genug HTML rendern um needs_javascript() zu täuschen
+            needs_pw = html and needs_javascript(html)
+
+            if html and not needs_pw:
+                # Quick-Check: hat die Seite überhaupt interne Links?
+                _soup_check = BeautifulSoup(html, "html.parser")
+                internal_links = [
+                    a.get("href", "") for a in _soup_check.select("a[href]")
+                    if is_internal(urljoin(url, a.get("href", "")), base_domain)
+                ]
+                if len(internal_links) == 0:
+                    needs_pw = True
+                    logger.info(f"🔄 0 interne Links, nutze Playwright: {url}")
+
+            if needs_pw:
                 if not playwright_browser:
                     playwright_instance = await async_playwright().start()
                     playwright_browser = await playwright_instance.chromium.launch(
@@ -875,7 +894,7 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "status": "running",
         "improvements": [
             "httpx + Playwright fallback (10x faster)",
@@ -886,6 +905,7 @@ async def root():
             "Better URL normalization (no utm/tracking params)",
             "Dynamic keywords from Supabase config_keywords (v2.2.0)",
             "priority_weight scoring + negative keyword dampening (v2.2.0)",
+            "Smarter JS detection: Playwright on 0 internal links (v2.3.0)",
         ],
         "endpoints": {
             "discover": "/discover (GROUP A, E, F only – GROUP B via fetch-apis)",
@@ -902,7 +922,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -1074,7 +1094,7 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.2.0 (Dynamic Keywords)...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.3.0 (Smarter JS Detection)...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info(f"🔄 Retry: {MAX_RETRIES}x mit Delays {RETRY_DELAYS}s")

@@ -13,6 +13,9 @@ v2.0.0 - Angepasst an Discovery API v2.0:
   - Retry-Logik bei Timeouts/Server-Fehlern
 
 v1.3.0 - Added /fetch-markdown-batch endpoint for parallel processing
+
+v2.1.0 - Batch Limit von 3 auf 20 erhöht + Semaphore(8) zum Schutz vor
+         Playwright-Überlastung. n8n batchSize auf 20 setzen.
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -57,8 +60,8 @@ async def get_http_client() -> httpx.AsyncClient:
             timeout=25,
             follow_redirects=True,
             limits=httpx.Limits(
-                max_connections=15,
-                max_keepalive_connections=10,
+                max_connections=30,
+                max_keepalive_connections=20,
             ),
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -476,7 +479,6 @@ async def fetch_and_convert(url: str) -> dict:
                 "error": None
             }
         else:
-            # pymupdf nicht installiert oder PDF nicht lesbar
             logger.warning(f"⚠️ PDF-Extraktion fehlgeschlagen: {url}")
             return {
                 "data": f"[PDF-Dokument – Text-Extraktion fehlgeschlagen]\nURL: {url}",
@@ -494,7 +496,6 @@ async def fetch_and_convert(url: str) -> dict:
 
     # Content-Type Check: vielleicht ist es doch ein PDF (URL hatte kein .pdf)
     if html is None:
-        # Prüfe ob es ein PDF via Content-Type war
         try:
             client = await get_http_client()
             head_r = await client.head(url)
@@ -589,7 +590,7 @@ async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetc
 
 
 # =============================================================================
-# BATCH ENDPOINT (Response-Format UNVERÄNDERT für n8n Kompatibilität)
+# BATCH ENDPOINT v2.1.0 — 20 URLs, Semaphore(8) gegen Playwright-Überlastung
 # =============================================================================
 
 class BatchRequest(BaseModel):
@@ -598,10 +599,11 @@ class BatchRequest(BaseModel):
 @router.post("/fetch-markdown-batch")
 async def fetch_markdown_batch(request: BatchRequest):
     """
-    BATCH ENDPOINT – bis zu 3 URLs parallel verarbeiten
+    BATCH ENDPOINT – bis zu 20 URLs parallel verarbeiten
+    Semaphore(8) verhindert Playwright-Überlastung bei JS-Seiten.
 
     POST /fetch-markdown-batch
-    Body: { "urls": ["https://url1", "https://url2", "https://url3"] }
+    Body: { "urls": ["https://url1", ..., "https://url20"] }
 
     Response-Format identisch zu v1.3.0
     """
@@ -609,14 +611,21 @@ async def fetch_markdown_batch(request: BatchRequest):
     if not request.urls:
         raise HTTPException(status_code=400, detail="urls list is required")
 
-    # Max 3 URLs pro Batch
-    urls = request.urls[:3]
+    # Max 20 URLs pro Batch (war: 3)
+    urls = request.urls[:20]
 
     logger.info(f"🚀 Batch fetch started: {len(urls)} URLs")
 
-    # Alle URLs parallel fetchen
+    # Semaphore: max 8 gleichzeitig – schützt Playwright vor RAM-Überlastung
+    semaphore = asyncio.Semaphore(8)
+
+    async def fetch_with_limit(url: str) -> dict:
+        async with semaphore:
+            return await fetch_and_convert(url)
+
+    # Alle URLs parallel fetchen (mit Semaphore-Bremse)
     raw_results = await asyncio.gather(
-        *[fetch_and_convert(url) for url in urls],
+        *[fetch_with_limit(url) for url in urls],
         return_exceptions=True
     )
 

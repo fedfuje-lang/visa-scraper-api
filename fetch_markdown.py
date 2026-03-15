@@ -3,19 +3,10 @@ Fetch Markdown API - Jina Replacement
 FastAPI Endpoint deployed on Railway.app
 Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
-Response format: { "data": "markdown..." }
-Compatible with existing Clean Markdown Code Node in n8n WF2
-
-v2.0.0 - Angepasst an Discovery API v2.0:
-  - httpx als Standard, Playwright nur Fallback (wie Discovery)
-  - Globaler httpx Client (Connection Pooling)
-  - PDF-Extraktion mit pymupdf (PDFs werden nicht mehr übersprungen)
-  - Retry-Logik bei Timeouts/Server-Fehlern
-
-v1.3.0 - Added /fetch-markdown-batch endpoint for parallel processing
-
-v2.1.0 - Batch Limit von 3 auf 20 erhöht + Semaphore(8) zum Schutz vor
-         Playwright-Überlastung. n8n batchSize auf 20 setzen.
+v2.2.0 - Encoding Fix: UTF-8 first, Fallback auf deklariertes Encoding
+         Behebt kaputte Umlaute bei deutschen Seiten (ü → 眉 etc.)
+v2.1.0 - Batch Limit 15, Semaphore(8)
+v2.0.0 - httpx Standard, Playwright Fallback, PDF Support
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -32,28 +23,15 @@ import os
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# ROUTER (wird in discovery_api.py eingebunden)
-# =============================================================================
-
 router = APIRouter()
-
-# =============================================================================
-# CONFIG
-# =============================================================================
 
 MAX_RETRIES = 3
 RETRY_DELAYS = [1, 3, 5]
-
-# =============================================================================
-# GLOBALER HTTPX CLIENT (Connection Pooling – wie im Discovery Script)
-# =============================================================================
 
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 async def get_http_client() -> httpx.AsyncClient:
-    """Gibt den globalen httpx Client zurück."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
@@ -74,12 +52,7 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-# =============================================================================
-# PDF DETECTION + EXTRACTION
-# =============================================================================
-
 def is_pdf_url(url: str) -> bool:
-    """Erkennt ob eine URL auf eine PDF zeigt"""
     url_lower = url.lower().strip()
     if url_lower.endswith(".pdf"):
         return True
@@ -89,43 +62,28 @@ def is_pdf_url(url: str) -> bool:
 
 
 async def extract_pdf_text(url: str) -> Optional[str]:
-    """Lädt PDF herunter und extrahiert Text mit pymupdf.
-    Gibt None zurück wenn pymupdf nicht installiert oder PDF nicht lesbar.
-    """
     try:
-        import fitz  # pymupdf
+        import fitz
     except ImportError:
-        logger.warning("⚠️ pymupdf nicht installiert – PDF-Extraktion nicht verfügbar")
+        logger.warning("⚠️ pymupdf nicht installiert")
         return None
 
     try:
         client = await get_http_client()
         r = await client.get(url)
-
         if r.status_code != 200:
-            logger.warning(f"⚠️ PDF Download fehlgeschlagen: Status {r.status_code}")
             return None
 
-        # PDF in temporäre Datei schreiben
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp.write(r.content)
             tmp_path = tmp.name
 
         try:
             doc = fitz.open(tmp_path)
-            text_parts = []
-            for page in doc:
-                text_parts.append(page.get_text())
+            text_parts = [page.get_text() for page in doc]
             doc.close()
-
             full_text = "\n\n".join(text_parts).strip()
-
-            if len(full_text) < 50:
-                logger.info(f"📄 PDF hat kaum Text (vermutlich gescannt): {url}")
-                return None
-
-            return full_text
-
+            return full_text if len(full_text) >= 50 else None
         finally:
             os.unlink(tmp_path)
 
@@ -135,46 +93,54 @@ async def extract_pdf_text(url: str) -> Optional[str]:
 
 
 def pdf_text_to_markdown(text: str, url: str) -> str:
-    """Konvertiert extrahierten PDF-Text in einfaches Markdown."""
     lines = text.split("\n")
     md_lines = []
-
     for line in lines:
         line = line.strip()
         if not line:
             md_lines.append("")
-            continue
-
-        # Kurze Zeilen in Großbuchstaben → vermutlich Überschriften
-        if line.isupper() and len(line) < 100:
+        elif line.isupper() and len(line) < 100:
             md_lines.append(f"\n## {line.title()}\n")
         else:
             md_lines.append(line)
-
     markdown = "\n".join(md_lines)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return markdown.strip()
 
 
-# =============================================================================
-# HTML FETCHING: HTTPX (schnell) + PLAYWRIGHT FALLBACK
-# =============================================================================
+def decode_response(r: httpx.Response) -> str:
+    """
+    v2.2.0: Encoding Fix für deutsche Umlaute.
+    UTF-8 first — viele Seiten deklarieren latin-1 aber senden UTF-8.
+    Fallback auf deklariertes Encoding, dann latin-1.
+    """
+    try:
+        return r.content.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    detected_encoding = r.encoding or "latin-1"
+    try:
+        return r.content.decode(detected_encoding, errors="replace")
+    except (LookupError, UnicodeDecodeError):
+        pass
+
+    return r.content.decode("latin-1", errors="replace")
+
 
 async def fetch_html_fast(url: str) -> Optional[str]:
-    """Schneller HTML-Fetch mit httpx + Retry-Logik."""
     client = await get_http_client()
 
     for attempt in range(MAX_RETRIES):
         try:
             r = await client.get(url)
 
-            # Content-Type prüfen
             content_type = r.headers.get("content-type", "")
             if "application/pdf" in content_type:
-                return None  # PDF wird separat behandelt
+                return None
 
             if r.status_code == 200:
-                return r.text
+                return decode_response(r)
             elif r.status_code in (429, 503, 502):
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_DELAYS[attempt]
@@ -201,7 +167,6 @@ async def fetch_html_fast(url: str) -> Optional[str]:
 
 
 async def fetch_html_playwright(url: str) -> Optional[str]:
-    """Fallback: Playwright für JavaScript-lastige Seiten."""
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -217,10 +182,9 @@ async def fetch_html_playwright(url: str) -> Optional[str]:
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800},
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9,de;q=0.8"}
             )
 
-            # Bilder/Tracking blockieren (wie vorher)
             await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
                                lambda route: route.abort())
             await context.route("**/{analytics,tracking,ads,doubleclick}**",
@@ -240,10 +204,8 @@ async def fetch_html_playwright(url: str) -> Optional[str]:
 
 
 def needs_javascript(html: str) -> bool:
-    """Erkennt ob die Seite JavaScript braucht um Content zu laden."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Hauptinhalt extrahieren
     content = (
         soup.find("main") or
         soup.find("article") or
@@ -252,12 +214,10 @@ def needs_javascript(html: str) -> bool:
     )
     text = content.get_text(" ", strip=True) if content else soup.get_text(" ", strip=True)
 
-    # Wenig Text + viele Scripts → braucht JS
     script_count = len(soup.find_all("script"))
     if len(text) < 200 and script_count > 5:
         return True
 
-    # SPA-Frameworks erkennen
     html_lower = html.lower()
     spa_indicators = ["__next", "__nuxt", "react-root", "ng-app", "v-app", 'id="app"']
     if len(text) < 200 and any(ind in html_lower for ind in spa_indicators):
@@ -265,10 +225,6 @@ def needs_javascript(html: str) -> bool:
 
     return False
 
-
-# =============================================================================
-# HTML → MARKDOWN CONVERSION (UNVERÄNDERT – n8n Kompatibilität)
-# =============================================================================
 
 def html_to_markdown(html: str, url: str = "") -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -373,7 +329,6 @@ def _convert_element(element, lines: list, depth: int = 0):
 
 def _convert_table(table_element) -> str:
     all_rows = table_element.find_all("tr")
-
     if not all_rows:
         return ""
 
@@ -396,10 +351,6 @@ def _convert_table(table_element) -> str:
 
     return "\n".join(markdown_rows) if markdown_rows else ""
 
-
-# =============================================================================
-# QUALITY SCORING (UNVERÄNDERT – n8n Kompatibilität)
-# =============================================================================
 
 def calculate_quality_score(markdown: str) -> dict:
     score = 0
@@ -447,78 +398,48 @@ def calculate_quality_score(markdown: str) -> dict:
     return details
 
 
-# =============================================================================
-# MAIN FETCH FUNCTION (NEU: httpx → Playwright Fallback → PDF Support)
-# =============================================================================
-
 async def fetch_and_convert(url: str) -> dict:
-    """Holt eine URL und konvertiert sie zu Markdown.
-    Reihenfolge:
-      1. PDF? → PDF-Extraktion
-      2. httpx (schnell)
-      3. Braucht JS? → Playwright Fallback
-    Response-Format bleibt identisch für n8n Kompatibilität.
-    """
-
-    # ─── PDF Handling ───
     if is_pdf_url(url):
-        logger.info(f"📄 PDF erkannt, versuche Extraktion: {url}")
+        logger.info(f"📄 PDF erkannt: {url}")
         pdf_text = await extract_pdf_text(url)
 
         if pdf_text:
             markdown = pdf_text_to_markdown(pdf_text, url)
             quality = calculate_quality_score(markdown)
-            logger.info(f"✅ PDF extrahiert: {url} → {quality['word_count']} Wörter")
             return {
-                "data": markdown,
-                "url": url,
-                "content_type": "pdf",
-                "quality_score": quality["final_score"],
-                "quality_details": quality,
-                "success": True,
-                "error": None
+                "data": markdown, "url": url, "content_type": "pdf",
+                "quality_score": quality["final_score"], "quality_details": quality,
+                "success": True, "error": None
             }
         else:
-            logger.warning(f"⚠️ PDF-Extraktion fehlgeschlagen: {url}")
             return {
-                "data": f"[PDF-Dokument – Text-Extraktion fehlgeschlagen]\nURL: {url}",
-                "url": url,
-                "content_type": "pdf",
-                "quality_score": 0,
+                "data": f"[PDF-Extraktion fehlgeschlagen]\nURL: {url}",
+                "url": url, "content_type": "pdf", "quality_score": 0,
                 "quality_details": {"quality_status": "pdf_extraction_failed", "word_count": 0},
-                "success": False,
-                "error": "PDF text extraction failed (pymupdf may not be installed)"
+                "success": False, "error": "PDF text extraction failed"
             }
 
-    # ─── HTML Handling: httpx zuerst ───
     logger.info(f"🌐 Fetching: {url}")
     html = await fetch_html_fast(url)
 
-    # Content-Type Check: vielleicht ist es doch ein PDF (URL hatte kein .pdf)
     if html is None:
         try:
             client = await get_http_client()
             head_r = await client.head(url)
             ct = head_r.headers.get("content-type", "")
             if "application/pdf" in ct:
-                logger.info(f"📄 PDF via Content-Type erkannt: {url}")
                 pdf_text = await extract_pdf_text(url)
                 if pdf_text:
                     markdown = pdf_text_to_markdown(pdf_text, url)
                     quality = calculate_quality_score(markdown)
                     return {
-                        "data": markdown,
-                        "url": url,
-                        "content_type": "pdf",
-                        "quality_score": quality["final_score"],
-                        "quality_details": quality,
-                        "success": True,
-                        "error": None
+                        "data": markdown, "url": url, "content_type": "pdf",
+                        "quality_score": quality["final_score"], "quality_details": quality,
+                        "success": True, "error": None
                     }
         except Exception:
             pass
 
-    # Fallback: Playwright wenn httpx komplett fehlschlägt
     if html is None:
         logger.info(f"🔄 httpx fehlgeschlagen, versuche Playwright: {url}")
         html = await fetch_html_playwright(url)
@@ -526,48 +447,31 @@ async def fetch_and_convert(url: str) -> dict:
     if html is None:
         return {
             "data": f"[Seite konnte nicht geladen werden]\nURL: {url}",
-            "url": url,
-            "content_type": "error",
-            "quality_score": 0,
+            "url": url, "content_type": "error", "quality_score": 0,
             "quality_details": {"quality_status": "fetch_error", "word_count": 0},
-            "success": False,
-            "error": "Both httpx and Playwright failed to fetch the page"
+            "success": False, "error": "Both httpx and Playwright failed"
         }
 
-    # ─── JS-Check: Playwright Fallback wenn nötig ───
     if needs_javascript(html):
         logger.info(f"🔄 JS-Seite erkannt, nutze Playwright: {url}")
         pw_html = await fetch_html_playwright(url)
         if pw_html:
             html = pw_html
 
-    # ─── Markdown Konvertierung ───
     markdown = html_to_markdown(html, url)
     quality = calculate_quality_score(markdown)
 
     logger.info(f"✅ Fetched {url} → {quality['word_count']} words, score: {quality['final_score']}/10")
 
     return {
-        "data": markdown,
-        "url": url,
-        "content_type": "html",
-        "quality_score": quality["final_score"],
-        "quality_details": quality,
-        "success": True,
-        "error": None
+        "data": markdown, "url": url, "content_type": "html",
+        "quality_score": quality["final_score"], "quality_details": quality,
+        "success": True, "error": None
     }
 
 
-# =============================================================================
-# API ENDPOINTS (Response-Format UNVERÄNDERT für n8n Kompatibilität)
-# =============================================================================
-
 @router.get("/fetch-markdown")
 async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetch and convert to Markdown")):
-    """
-    EINZELNER URL ENDPOINT (unverändert)
-    GET /fetch-markdown?url=https://...
-    """
     if not url:
         raise HTTPException(status_code=400, detail="url parameter is required")
     if not url.startswith("http"):
@@ -579,76 +483,55 @@ async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetc
     except Exception as e:
         logger.error(f"❌ Error fetching {url}: {str(e)}")
         return {
-            "data": f"[Fehler beim Laden der Seite]\nURL: {url}\nFehler: {str(e)}",
-            "url": url,
-            "content_type": "error",
-            "quality_score": 0,
+            "data": f"[Fehler]\nURL: {url}\nFehler: {str(e)}",
+            "url": url, "content_type": "error", "quality_score": 0,
             "quality_details": {"quality_status": "fetch_error", "word_count": 0},
-            "success": False,
-            "error": str(e)
+            "success": False, "error": str(e)
         }
 
-
-# =============================================================================
-# BATCH ENDPOINT v2.1.0 — 20 URLs, Semaphore(8) gegen Playwright-Überlastung
-# =============================================================================
 
 class BatchRequest(BaseModel):
     urls: List[str]
 
+
 @router.post("/fetch-markdown-batch")
 async def fetch_markdown_batch(request: BatchRequest):
     """
-    BATCH ENDPOINT – bis zu 20 URLs parallel verarbeiten
-    Semaphore(8) verhindert Playwright-Überlastung bei JS-Seiten.
-
-    POST /fetch-markdown-batch
-    Body: { "urls": ["https://url1", ..., "https://url20"] }
-
-    Response-Format identisch zu v1.3.0
+    BATCH ENDPOINT – bis zu 15 URLs parallel
+    v2.2.0: Encoding Fix für deutsche Umlaute
     """
-
     if not request.urls:
         raise HTTPException(status_code=400, detail="urls list is required")
 
-    # Max 20 URLs pro Batch (war: 3)
-    urls = request.urls[:20]
-
+    urls = request.urls[:15]
     logger.info(f"🚀 Batch fetch started: {len(urls)} URLs")
 
-    # Semaphore: max 8 gleichzeitig – schützt Playwright vor RAM-Überlastung
     semaphore = asyncio.Semaphore(8)
 
     async def fetch_with_limit(url: str) -> dict:
         async with semaphore:
             return await fetch_and_convert(url)
 
-    # Alle URLs parallel fetchen (mit Semaphore-Bremse)
     raw_results = await asyncio.gather(
         *[fetch_with_limit(url) for url in urls],
         return_exceptions=True
     )
 
-    # Ergebnisse aufbereiten – Exceptions sauber behandeln
     results = []
     for i, result in enumerate(raw_results):
         if isinstance(result, Exception):
             logger.error(f"❌ Batch item {i} failed: {str(result)}")
             results.append({
-                "data": f"[Fehler beim Laden der Seite]\nURL: {urls[i]}\nFehler: {str(result)}",
-                "url": urls[i],
-                "content_type": "error",
-                "quality_score": 0,
+                "data": f"[Fehler]\nURL: {urls[i]}\nFehler: {str(result)}",
+                "url": urls[i], "content_type": "error", "quality_score": 0,
                 "quality_details": {"quality_status": "fetch_error", "word_count": 0},
-                "success": False,
-                "error": str(result)
+                "success": False, "error": str(result)
             })
         else:
             results.append(result)
 
     successful = sum(1 for r in results if r.get("success", False))
     failed = len(results) - successful
-
     logger.info(f"✅ Batch complete: {successful} successful, {failed} failed")
 
     return {

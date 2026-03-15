@@ -4,40 +4,12 @@ FastAPI Service deployed on Railway.app
 Calls Python discovery logic and returns results to n8n
 
 v2.0.0 - Optimized Crawling Engine
-  - httpx als Standard (Playwright nur Fallback für JS-Seiten)
-  - Paralleles Crawling (10 gleichzeitig)
-  - URL-Path-Filter (nur relevante Pfade)
-  - Sitemap-Parser (checkt /sitemap.xml zuerst)
-  - Bessere Text-Extraktion (main/article statt ganze Seite)
-  - Bessere URL-Normalisierung (query params entfernt)
-
 v2.0.1 - Crawling-Engine Feinschliff
-  - Globaler httpx Client (Connection Pooling statt Client pro Request)
-  - deque statt list für Crawl-Queue (O(1) statt O(n))
-  - to_visit_set für Duplicate-Check (O(1) statt O(n) List Comprehension)
-  - Retry-Logik (3 Versuche mit Backoff bei Timeout/429/503)
-
 v2.1.0 - Multilingual Fix
-  - is_relevant_path() aus Crawling-Filtern entfernt
-  - Funktioniert jetzt für alle Sprachen/Länder ohne Keyword-Anpassung
-  - Nur BLOCKED_PATH_PATTERNS blockt — WF1b/Gemini übernehmen Qualitätskontrolle
-
-v2.3.0 - Smarter JS Detection
-  - Playwright wird auch getriggert wenn httpx HTML liefert aber 0 interne Links findet
-  - Verhindert stille Ausfälle bei SPAs die genug HTML rendern um needs_javascript() zu täuschen
-  - Kein manuelles Flag nötig — universell für alle Länder
-
 v2.2.0 - Dynamic Keywords
-  - Keywords aus Supabase config_keywords Tabelle (ALL + länderspezifisch)
-  - Cache-Key (country_iso, target_group) — kein Mix zwischen Gruppen
-  - priority_weight (1-5) ersetzt fixe Gewichtung
-  - is_negative dämpft Score subtraktiv (nicht blockend, min 1)
-  - match_type ('url', 'content', 'both') steuert Suchbereich
-  - GROUP_KEYWORDS bleibt als Fallback falls Supabase-Abfrage fehlschlägt
-
-v1.4.0 - fetch_worldbank replaced by fetch_apis (generic API fetcher)
-v1.3.0 - GROUP B excluded from Discovery (World Bank API handles GROUP B)
-v1.2.0 - Added /fetch-markdown endpoint (Jina replacement)
+v2.3.0 - Smarter JS Detection
+v2.3.1 - BUEROKRATIE Fix: Umlaut aus target_group entfernt (Encoding-Kompatibilität)
+         GROUP F: BÜROKRATIE → GROUP F: BUEROKRATIE in allen Fallback-Maps
 """
 
 from fastapi import FastAPI, HTTPException
@@ -56,24 +28,18 @@ from typing import Optional, List, Dict, Tuple
 import logging
 import xml.etree.ElementTree as ET
 
-# Fetch Markdown Router (Jina Replacement)
 from fetch_markdown import router as fetch_markdown_router
-
-# Generic API Fetcher Router (GROUP B Finanzen – World Bank, BLS, Eurostat...)
 from fetch_apis import router as fetch_apis_router
 
-# Logging Setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI App
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.3.0"
+    version="2.3.1"
 )
 
-# CORS Middleware (für n8n)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -82,11 +48,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Router einbinden
 app.include_router(fetch_markdown_router)
 app.include_router(fetch_apis_router)
 
-# Supabase Connection (aus Environment Variables)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -96,7 +60,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================================================================
-# GROUP B wird von fetch_apis gehandelt – nicht von Discovery
+# GROUP B wird von fetch_apis gehandelt
 # =============================================================================
 
 EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
@@ -105,22 +69,16 @@ EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
 # CRAWLING CONFIG
 # =============================================================================
 
-# Max gleichzeitige Requests
 CONCURRENT_LIMIT = 10
-
-# Retry-Config für fehlgeschlagene Requests
 MAX_RETRIES = 3
-RETRY_DELAYS = [1, 3, 5]  # Sekunden zwischen den Versuchen
+RETRY_DELAYS = [1, 3, 5]
 
-# Query-Parameter die beim Normalisieren entfernt werden
 IGNORED_QUERY_PARAMS = [
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "ref", "source", "session", "sid",
     "page", "p", "lang", "language", "locale",
 ]
 
-# URL-Pfade die NICHT gecrawlt werden (spart unnötige Requests)
-# Sprachunabhängig — diese Pfade sind in allen Ländern gleich unbrauchbar
 BLOCKED_PATH_PATTERNS = [
     "/privacy", "/datenschutz", "/cookie", "/impressum", "/imprint",
     "/login", "/signin", "/signup", "/register", "/account",
@@ -140,13 +98,9 @@ BLOCKED_PATH_PATTERNS = [
     "#",
 ]
 
-# NOTE: is_relevant_path() wird nicht mehr als Filter verwendet (v2.1.0)
-# Grund: englische Keywords blockierten nicht-englische URLs (DE, ES, FR, etc.)
-# Qualitätskontrolle übernehmen WF1b (quality_score) und WF2 (Gemini)
-
 # =============================================================================
-# FALLBACK KEYWORDS — unverändert aus v2.1.0
-# Nur aktiv wenn load_keywords() fehlschlägt (Supabase nicht erreichbar etc.)
+# FALLBACK KEYWORDS
+# v2.3.1: GROUP F: BÜROKRATIE → GROUP F: BUEROKRATIE
 # =============================================================================
 
 GROUP_KEYWORDS = {
@@ -176,7 +130,7 @@ GROUP_KEYWORDS = {
         "library", "campus", "dormitory", "student visa", "f-1",
         "vocational training", "apprenticeship", "qualification recognition"
     ],
-    "GROUP F: BÜROKRATIE": [
+    "GROUP F: BUEROKRATIE": [
         "registration", "register", "bureaucracy", "administration",
         "office", "authority", "government", "municipal", "city hall",
         "police registration", "residence registration", "anmeldung",
@@ -201,24 +155,13 @@ GENERAL_KEYWORDS = [
 ]
 
 # =============================================================================
-# ÄNDERUNG 1/3: KEYWORD CACHE + load_keywords()
-# Cache-Key: (country_iso, target_group) — verhindert Mix zwischen Gruppen
+# KEYWORD CACHE + load_keywords()
 # =============================================================================
 
 _keywords_cache: Dict[Tuple[str, str], Dict] = {}
 
 
 async def load_keywords(country_iso: str, target_group: str) -> Optional[Dict]:
-    """
-    Lädt Keywords aus config_keywords für ein Land + Gruppe.
-    Kombiniert 'ALL' (globale Basis) + länderspezifische Keywords.
-
-    Cache-Key: (country_iso, target_group)
-    → DE/GROUP A und DE/GROUP E werden getrennt gecacht — kein Keyword-Mix.
-    → Innerhalb eines Discovery-Runs wird jede Kombination nur einmal geladen.
-
-    Gibt None zurück wenn Supabase fehlschlägt → score_url() nutzt Fallback.
-    """
     cache_key = (country_iso, target_group)
 
     if cache_key in _keywords_cache:
@@ -232,10 +175,7 @@ async def load_keywords(country_iso: str, target_group: str) -> Optional[Dict]:
         ).execute()
 
         if not response.data:
-            logger.warning(
-                f"⚠️ Keine Keywords in config_keywords für "
-                f"({country_iso}, {target_group}) — Fallback aktiv"
-            )
+            logger.warning(f"⚠️ Keine Keywords für ({country_iso}, {target_group}) — Fallback aktiv")
             return None
 
         positive = []
@@ -255,40 +195,29 @@ async def load_keywords(country_iso: str, target_group: str) -> Optional[Dict]:
         result = {"positive": positive, "negative": negative}
         _keywords_cache[cache_key] = result
 
-        logger.info(
-            f"📚 Keywords geladen ({country_iso}, {target_group}): "
-            f"{len(positive)} positiv, {len(negative)} negativ"
-        )
+        logger.info(f"📚 Keywords geladen ({country_iso}, {target_group}): {len(positive)} positiv, {len(negative)} negativ")
         return result
 
     except Exception as e:
-        logger.warning(
-            f"⚠️ config_keywords Abfrage fehlgeschlagen "
-            f"({country_iso}, {target_group}): {e} — Fallback aktiv"
-        )
+        logger.warning(f"⚠️ config_keywords Abfrage fehlgeschlagen ({country_iso}, {target_group}): {e} — Fallback aktiv")
         return None
 
 
 def clear_keywords_cache():
-    """Cache leeren — einmal pro /discover Aufruf."""
     global _keywords_cache
     _keywords_cache = {}
 
 
 # =============================================================================
-# HELPER FUNCTIONS — unverändert aus v2.1.0
+# HELPER FUNCTIONS
 # =============================================================================
 
 def normalize_url(url: str) -> str:
-    """Normalisiert URL: entfernt Fragment UND unnötige Query-Parameter."""
     parsed = urlparse(url)
 
     if parsed.query:
         params = parse_qs(parsed.query, keep_blank_values=True)
-        filtered = {
-            k: v for k, v in params.items()
-            if k.lower() not in IGNORED_QUERY_PARAMS
-        }
+        filtered = {k: v for k, v in params.items() if k.lower() not in IGNORED_QUERY_PARAMS}
         clean_query = urlencode(filtered, doseq=True) if filtered else ""
     else:
         clean_query = ""
@@ -299,7 +228,6 @@ def normalize_url(url: str) -> str:
 
 
 def is_internal(url: str, base_domain: str) -> bool:
-    """Prüft ob URL zur gleichen Domain gehört."""
     try:
         ext = tldextract.extract(url)
         current_domain = f"{ext.domain}.{ext.suffix}"
@@ -309,17 +237,13 @@ def is_internal(url: str, base_domain: str) -> bool:
 
 
 def is_blocked_path(url: str) -> bool:
-    """Prüft ob der URL-Pfad auf der Blocklist steht."""
     path_lower = urlparse(url).path.lower()
     return any(blocked in path_lower for blocked in BLOCKED_PATH_PATTERNS)
 
 
 def extract_main_content(soup: BeautifulSoup) -> str:
-    """Extrahiert nur den Hauptinhalt der Seite (nicht Navigation/Footer/Sidebar)."""
     content = soup.select_one(
-        "main, "
-        "article, "
-        "[role='main'], "
+        "main, article, [role='main'], "
         "#content, #main-content, #main, "
         ".content, .main-content, .page-content, .entry-content, "
         ".article-body, .post-content"
@@ -339,39 +263,20 @@ def extract_main_content(soup: BeautifulSoup) -> str:
 
 
 # =============================================================================
-# ÄNDERUNG 2/3: score_url() — nimmt keywords_config Parameter
-# Fallback auf GROUP_KEYWORDS wenn keywords_config=None
+# SCORE URL
 # =============================================================================
 
 def score_url(url: str, text: str, target_group: str,
               keywords_config: Optional[Dict] = None) -> int:
-    """
-    Relevanz-Score berechnen.
-
-    v2.2.0: Nutzt keywords_config aus config_keywords wenn übergeben.
-    - priority_weight (1-5): Punkte pro Treffer
-    - URL-Pfad Treffer: weight * 2 (wie bisher stärker gewichtet)
-    - URL-Domain Treffer: weight * 1
-    - Content Treffer: weight * 1
-    - is_negative: subtrahiert weight (dämpft, blockiert nicht)
-    - match_type 'url': nur URL prüfen
-    - match_type 'content': nur Text prüfen
-    - match_type 'both': beide prüfen
-
-    Fallback: GROUP_KEYWORDS mit v2.1.0 Logik wenn keywords_config=None.
-    Score bleibt immer zwischen 1 und 10.
-    """
     score = 0
     url_lower = url.lower()
     text_lower = text.lower()
     path_lower = urlparse(url).path.lower()
 
-    # General Keywords — unverändert, sprachunabhängige Basis
     general_matches = sum(1 for kw in GENERAL_KEYWORDS if kw in url_lower or kw in text_lower)
     score += min(general_matches, 2)
 
     if keywords_config is not None:
-        # ── Neue Logik v2.2.0: config_keywords ───────────────────
         for entry in keywords_config["positive"]:
             kw         = entry["keyword"]
             weight     = entry["weight"]
@@ -379,9 +284,9 @@ def score_url(url: str, text: str, target_group: str,
 
             if match_type in ("url", "both"):
                 if kw in path_lower:
-                    score += weight * 2      # Pfad-Treffer: doppelt gewichtet
+                    score += weight * 2
                 elif kw in url_lower:
-                    score += weight          # Domain/Query-Treffer: einfach
+                    score += weight
 
             if match_type in ("content", "both"):
                 if kw in text_lower:
@@ -398,10 +303,9 @@ def score_url(url: str, text: str, target_group: str,
             if match_type in ("content", "both") and kw in text_lower:
                 hit = True
             if hit:
-                score -= weight              # Dämpfen, nicht blocken
+                score -= weight
 
     else:
-        # ── Fallback: GROUP_KEYWORDS v2.1.0 Logik ────────────────
         if target_group in GROUP_KEYWORDS:
             group_kws = GROUP_KEYWORDS[target_group]
 
@@ -414,7 +318,6 @@ def score_url(url: str, text: str, target_group: str,
             text_matches = sum(1 for kw in group_kws if kw in text_lower)
             score += min(text_matches, 4)
 
-    # Text-Länge Bonus — unverändert
     if len(text) > 3000:
         score += 2
     elif len(text) > 1500:
@@ -426,7 +329,6 @@ def score_url(url: str, text: str, target_group: str,
 
 
 def extract_topics(text: str, url: str, target_group: str) -> List[str]:
-    """Extrahiert Topics aus Text und URL."""
     topics = []
     text_lower = text.lower()
     url_lower = url.lower()
@@ -447,7 +349,7 @@ def extract_topics(text: str, url: str, target_group: str) -> List[str]:
             "tuition fees": ["tuition", "fee", "scholarship"],
             "admission": ["admission", "application", "enrollment"]
         },
-        "GROUP F: BÜROKRATIE": {
+        "GROUP F: BUEROKRATIE": {
             "registration": ["registration", "anmeldung", "register"],
             "documents": ["document", "certificate", "form"],
             "id documents": ["passport", "id card"],
@@ -465,39 +367,31 @@ def extract_topics(text: str, url: str, target_group: str) -> List[str]:
 
 
 # =============================================================================
-# SITEMAP PARSER — unverändert aus v2.1.0
+# SITEMAP PARSER
 # =============================================================================
 
 async def fetch_sitemap_urls(base_url: str) -> List[str]:
-    """Versucht /sitemap.xml zu laden und gibt alle URLs zurück."""
     sitemap_url = urljoin(base_url, "/sitemap.xml")
     urls = []
 
     try:
         client = await get_http_client()
-        r = await client.get(sitemap_url, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.0)"
-        })
+        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.0)"})
 
         if r.status_code != 200:
-            logger.info(f"📋 Keine Sitemap gefunden bei {sitemap_url}")
             return []
 
         root = ET.fromstring(r.text)
-
         ns = ""
         if root.tag.startswith("{"):
             ns = root.tag.split("}")[0] + "}"
 
         sitemaps = root.findall(f".//{ns}sitemap/{ns}loc")
         if sitemaps:
-            logger.info(f"📋 Sitemap-Index gefunden mit {len(sitemaps)} Sub-Sitemaps")
             for sitemap_loc in sitemaps[:5]:
                 sub_url = sitemap_loc.text.strip()
                 try:
-                    sub_r = await client.get(sub_url, headers={
-                        "User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.0)"
-                    })
+                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.0)"})
                     if sub_r.status_code == 200:
                         sub_root = ET.fromstring(sub_r.text)
                         sub_ns = ""
@@ -522,14 +416,13 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
 
 
 # =============================================================================
-# GLOBALER HTTPX CLIENT — unverändert aus v2.1.0
+# GLOBALER HTTPX CLIENT
 # =============================================================================
 
 _http_client: Optional[httpx.AsyncClient] = None
 
 
 async def get_http_client() -> httpx.AsyncClient:
-    """Gibt den globalen httpx Client zurück."""
     global _http_client
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
@@ -551,7 +444,6 @@ async def get_http_client() -> httpx.AsyncClient:
 
 
 async def fetch_html_fast(url: str) -> Optional[str]:
-    """Schneller HTML-Fetch mit httpx + Retry-Logik."""
     client = await get_http_client()
 
     for attempt in range(MAX_RETRIES):
@@ -562,7 +454,7 @@ async def fetch_html_fast(url: str) -> Optional[str]:
             elif r.status_code in (429, 503, 502):
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_DELAYS[attempt]
-                    logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} (Status {r.status_code}, warte {delay}s)")
+                    logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} (Status {r.status_code})")
                     await asyncio.sleep(delay)
                     continue
             else:
@@ -571,7 +463,7 @@ async def fetch_html_fast(url: str) -> Optional[str]:
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             if attempt < MAX_RETRIES - 1:
                 delay = RETRY_DELAYS[attempt]
-                logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} ({type(e).__name__}, warte {delay}s)")
+                logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} ({type(e).__name__})")
                 await asyncio.sleep(delay)
                 continue
             else:
@@ -585,7 +477,6 @@ async def fetch_html_fast(url: str) -> Optional[str]:
 
 
 async def fetch_html_playwright(url: str, browser) -> Optional[str]:
-    """Fallback: Playwright für JavaScript-lastige Seiten."""
     try:
         page = await browser.new_page()
         await page.goto(url, timeout=30000, wait_until="domcontentloaded")
@@ -598,7 +489,6 @@ async def fetch_html_playwright(url: str, browser) -> Optional[str]:
 
 
 def needs_javascript(html: str) -> bool:
-    """Erkennt ob die Seite JavaScript braucht um Content zu laden."""
     soup = BeautifulSoup(html, "html.parser")
     text = extract_main_content(soup)
 
@@ -607,7 +497,7 @@ def needs_javascript(html: str) -> bool:
         return True
 
     html_lower = html.lower()
-    spa_indicators = ["__next", "__nuxt", "react-root", "ng-app", "v-app", "id=\"app\""]
+    spa_indicators = ["__next", "__nuxt", "react-root", "ng-app", "v-app", 'id="app"']
     if len(text) < 200 and any(ind in html_lower for ind in spa_indicators):
         return True
 
@@ -616,7 +506,6 @@ def needs_javascript(html: str) -> bool:
 
 # =============================================================================
 # MAIN DISCOVERY FUNCTION
-# ÄNDERUNG 3/3: load_keywords() einmal pro Rule aufrufen, an score_url() übergeben
 # =============================================================================
 
 async def discover_urls(rule: Dict) -> List[Dict]:
@@ -631,32 +520,22 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
     visited = set()
     discovered_urls = []
-
     semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
-
     playwright_instance = None
     playwright_browser = None
 
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
     logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
 
-    # v2.2.0: Keywords einmal pro Rule laden (gecacht nach country_iso + target_group)
     keywords_config = await load_keywords(country_iso, target_group)
 
-    # ─── SCHRITT 1: Sitemap checken ───
     sitemap_urls = await fetch_sitemap_urls(start_url)
-
     if sitemap_urls:
-        sitemap_filtered = [
-            u for u in sitemap_urls
-            if is_internal(u, base_domain)
-            and not is_blocked_path(u)
-        ]
+        sitemap_filtered = [u for u in sitemap_urls if is_internal(u, base_domain) and not is_blocked_path(u)]
         logger.info(f"📋 Sitemap: {len(sitemap_filtered)} relevante URLs (von {len(sitemap_urls)} total)")
     else:
         sitemap_filtered = []
 
-    # ─── SCHRITT 2: Crawl-Queue aufbauen ───
     to_visit = deque()
     to_visit_set = set()
 
@@ -671,21 +550,15 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         to_visit.appendleft((normalized_start, 0))
         to_visit_set.add(normalized_start)
 
-    # ─── SCHRITT 3: Paralleles Crawling ───
-
     async def process_page(url: str, depth: int) -> tuple:
-        """Einzelne Seite laden und verarbeiten."""
         nonlocal playwright_instance, playwright_browser
 
         async with semaphore:
             html = await fetch_html_fast(url)
 
-            # v2.3.0: Playwright wenn needs_javascript() ODER wenn httpx 0 interne Links liefert
-            # Zweite Bedingung fängt SPAs die genug HTML rendern um needs_javascript() zu täuschen
             needs_pw = html and needs_javascript(html)
 
             if html and not needs_pw:
-                # Quick-Check: hat die Seite überhaupt interne Links?
                 _soup_check = BeautifulSoup(html, "html.parser")
                 internal_links = [
                     a.get("href", "") for a in _soup_check.select("a[href]")
@@ -713,11 +586,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             title_tag = soup.find("title")
             page_title = title_tag.get_text(strip=True) if title_tag else ""
 
-            # v2.2.0: keywords_config übergeben
             relevance = score_url(url, text, target_group, keywords_config)
             topics = extract_topics(text, url, target_group)
 
-            # Links für weitere Crawling-Runden sammeln
             child_links = []
             if depth < max_depth:
                 for a_tag in soup.select("a[href]"):
@@ -728,11 +599,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     if not full_url.startswith("http"):
                         continue
                     normalized_full = normalize_url(full_url)
-
-                    # Filter: intern + nicht blockiert
-                    # is_relevant_path() NICHT mehr verwendet (v2.1.0 — multilingual fix)
-                    if (is_internal(normalized_full, base_domain)
-                            and not is_blocked_path(normalized_full)):
+                    if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
                         child_links.append(normalized_full)
 
             result = None
@@ -752,7 +619,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
             return url, depth, result, text, child_links, topics
 
-    # Crawling Loop: Batch-weise parallel — unverändert
     while to_visit and len(visited) < max_pages:
         batch = []
         while to_visit and len(batch) < CONCURRENT_LIMIT:
@@ -787,7 +653,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     to_visit.append((link, depth + 1))
                     to_visit_set.add(link)
 
-    # Playwright aufräumen
     if playwright_browser:
         await playwright_browser.close()
     if playwright_instance:
@@ -798,12 +663,11 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
 
 # =============================================================================
-# SUPABASE FUNCTIONS — unverändert aus v2.1.0
+# SUPABASE FUNCTIONS
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     if not discovered_urls:
-        logger.warning("⚠️ No URLs to save")
         return 0
 
     logger.info(f"💾 Preparing to save {len(discovered_urls)} URLs to Supabase...")
@@ -835,10 +699,7 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
         logger.info(f"🧹 Removed {duplicates_removed} duplicate URLs from batch")
 
     try:
-        response = supabase.table("discovered_urls").upsert(
-            insert_data,
-            on_conflict="url"
-        ).execute()
+        response = supabase.table("discovered_urls").upsert(insert_data, on_conflict="url").execute()
         inserted_count = len(response.data) if response.data else 0
         logger.info(f"✅ {inserted_count} URLs saved successfully")
         return inserted_count
@@ -849,16 +710,14 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
 
 def update_last_crawled(rule_id: str):
     try:
-        supabase.table("config_rules").update({
-            "last_crawled_at": "now()"
-        }).eq("rule_id", rule_id).execute()
+        supabase.table("config_rules").update({"last_crawled_at": "now()"}).eq("rule_id", rule_id).execute()
         logger.info(f"✅ Updated last_crawled_at for {rule_id}")
     except Exception as e:
         logger.warning(f"⚠️ Could not update last_crawled_at: {str(e)}")
 
 
 # =============================================================================
-# API ENDPOINTS — unverändert aus v2.1.0 (n8n Kompatibilität)
+# API ENDPOINTS
 # =============================================================================
 
 class DiscoveryRequest(BaseModel):
@@ -894,27 +753,9 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "status": "running",
-        "improvements": [
-            "httpx + Playwright fallback (10x faster)",
-            "Parallel crawling (10 concurrent)",
-            "Multilingual URL filtering (v2.1.0 — no more keyword blocking)",
-            "Sitemap parser (finds URLs instantly)",
-            "Smart content extraction (main/article only)",
-            "Better URL normalization (no utm/tracking params)",
-            "Dynamic keywords from Supabase config_keywords (v2.2.0)",
-            "priority_weight scoring + negative keyword dampening (v2.2.0)",
-            "Smarter JS detection: Playwright on 0 internal links (v2.3.0)",
-        ],
-        "endpoints": {
-            "discover": "/discover (GROUP A, E, F only – GROUP B via fetch-apis)",
-            "discover-direct": "/discover-direct (direct URLs from n8n)",
-            "fetch-markdown": "/fetch-markdown?url=... (Jina replacement)",
-            "fetch-markdown-batch": "/fetch-markdown-batch (3 URLs parallel)",
-            "fetch-apis": "/fetch-apis (GROUP B Finanzen – World Bank, BLS, Eurostat)",
-            "health": "/health"
-        }
+        "changes_v2.3.1": "BUEROKRATIE fix — Umlaut aus target_group entfernt"
     }
 
 
@@ -922,33 +763,20 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
 
 @app.post("/discover-direct", response_model=DirectDiscoveryResponse)
 async def discover_direct(request: DirectDiscoveryRequest):
-    """
-    Accepts start_urls directly (no Supabase config_rules needed)
-    GROUP B wird automatisch abgelehnt
-    """
-
     if any(excluded in request.target_group for excluded in EXCLUDED_FROM_DISCOVERY):
-        logger.warning(f"⚠️ GROUP B rejected from discovery – use /fetch-apis instead")
-        return DirectDiscoveryResponse(
-            success=False,
-            total_urls_found=0,
-            urls=[]
-        )
+        return DirectDiscoveryResponse(success=False, total_urls_found=0, urls=[])
 
     clear_keywords_cache()
 
     logger.info("=" * 80)
-    logger.info("🚀 DIRECT DISCOVERY STARTED (v2.2.0 – Dynamic Keywords)")
-    logger.info(f"📋 Country: {request.country_name} ({request.country_code})")
-    logger.info(f"📂 Group: {request.target_group}")
-    logger.info(f"🔗 Start URLs: {len(request.start_urls)}")
+    logger.info(f"🚀 DIRECT DISCOVERY: {request.country_name} ({request.country_code}) / {request.target_group}")
     logger.info("=" * 80)
 
     discovered_urls = []
@@ -969,31 +797,19 @@ async def discover_direct(request: DirectDiscoveryRequest):
             logger.info(f"✅ Found {len(urls)} URLs from start URL {i}")
 
         saved_count = save_urls_to_supabase(discovered_urls)
-        logger.info(f"✅ DIRECT DISCOVERY COMPLETED – {saved_count} URLs saved")
-
-        return DirectDiscoveryResponse(
-            success=True,
-            total_urls_found=saved_count,
-            urls=discovered_urls
-        )
+        return DirectDiscoveryResponse(success=True, total_urls_found=saved_count, urls=discovered_urls)
 
     except Exception as e:
-        logger.error(f"❌ Critical error in direct discovery: {str(e)}")
+        logger.error(f"❌ Critical error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/discover", response_model=DiscoveryResponse)
 async def run_discovery(request: DiscoveryRequest):
-    """
-    ORIGINAL ENDPOINT (uses config_rules from Supabase)
-    GROUP B: FINANZEN wird automatisch übersprungen – fetch-apis übernimmt
-    """
-
     clear_keywords_cache()
 
     logger.info("=" * 80)
-    logger.info("🚀 DISCOVERY API STARTED (v2.2.0 – Dynamic Keywords)")
-    logger.info(f"📋 Request: {request.dict()}")
+    logger.info(f"🚀 DISCOVERY API v2.3.1")
     logger.info("=" * 80)
 
     try:
@@ -1012,35 +828,22 @@ async def run_discovery(request: DiscoveryRequest):
         all_rules = response.data
 
         if not all_rules:
-            logger.warning("⚠️ No active rules found")
             return DiscoveryResponse(
-                success=False,
-                total_rules_processed=0,
-                total_urls_found=0,
-                successful_rules=0,
-                failed_rules=0,
-                results_per_rule=[]
+                success=False, total_rules_processed=0, total_urls_found=0,
+                successful_rules=0, failed_rules=0, results_per_rule=[]
             )
 
-        # GROUP B herausfiltern
-        rules = [
-            r for r in all_rules
-            if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)
-        ]
+        rules = [r for r in all_rules if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)]
         skipped = len(all_rules) - len(rules)
 
         if skipped > 0:
-            logger.info(f"⏭️ Skipped {skipped} GROUP B rules (handled by fetch-apis)")
-
-        logger.info(f"✅ Processing {len(rules)} rules (GROUP A, E, F only)")
+            logger.info(f"⏭️ Skipped {skipped} GROUP B rules")
 
         total_urls_found = 0
         results_per_rule = []
 
         for i, rule in enumerate(rules, 1):
-            logger.info(f"\n{'=' * 80}")
             logger.info(f"📍 Rule {i}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
-            logger.info(f"{'=' * 80}")
 
             try:
                 if request.max_urls:
@@ -1052,27 +855,17 @@ async def run_discovery(request: DiscoveryRequest):
 
                 total_urls_found += saved_count
                 results_per_rule.append({
-                    "rule_id":      rule['rule_id'],
-                    "country":      rule['country_name'],
-                    "target_group": rule['target_group'],
-                    "urls_found":   saved_count,
-                    "success":      True
+                    "rule_id": rule['rule_id'], "country": rule['country_name'],
+                    "target_group": rule['target_group'], "urls_found": saved_count, "success": True
                 })
 
             except Exception as e:
                 logger.error(f"❌ Error processing rule {rule['rule_id']}: {str(e)}")
                 results_per_rule.append({
-                    "rule_id":      rule['rule_id'],
-                    "country":      rule['country_name'],
+                    "rule_id": rule['rule_id'], "country": rule['country_name'],
                     "target_group": rule.get('target_group', 'unknown'),
-                    "urls_found":   0,
-                    "success":      False,
-                    "error":        str(e)
+                    "urls_found": 0, "success": False, "error": str(e)
                 })
-
-        logger.info(f"\n{'=' * 80}")
-        logger.info(f"✅ DISCOVERY COMPLETED – Total URLs: {total_urls_found}")
-        logger.info(f"{'=' * 80}")
 
         return DiscoveryResponse(
             success=True,
@@ -1089,25 +882,19 @@ async def run_discovery(request: DiscoveryRequest):
 
 
 # =============================================================================
-# STARTUP / SHUTDOWN — unverändert aus v2.1.0
+# STARTUP / SHUTDOWN
 # =============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.3.0 (Smarter JS Detection)...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.3.1...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
-    logger.info(f"🔄 Retry: {MAX_RETRIES}x mit Delays {RETRY_DELAYS}s")
     logger.info("✅ API is ready!")
-    logger.info("📍 Endpoints: /, /health, /discover, /discover-direct, /fetch-markdown, /fetch-markdown-batch, /fetch-apis")
-    logger.info("⚠️  GROUP B: FINANZEN excluded from discovery – use /fetch-apis")
-    logger.info("🌍 v2.1.0: Multilingual fix – is_relevant_path() removed from crawl filters")
-    logger.info("📚 v2.2.0: Dynamic keywords – config_keywords Tabelle, priority_weight, negative dampening")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """httpx Client sauber schließen beim Shutdown."""
     global _http_client
     if _http_client and not _http_client.is_closed:
         await _http_client.aclose()

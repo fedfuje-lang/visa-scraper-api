@@ -3,8 +3,12 @@ Fetch Markdown API - Jina Replacement
 FastAPI Endpoint deployed on Railway.app
 Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
+v2.3.0 - Drei Qualitäts-Fixes:
+  1. Relative Links Fix: urljoin für alle Links (keine PDF-Formulare mehr verloren)
+  2. Colspan Fix: Verbundene Tabellenzellen werden korrekt aufgefüllt
+  3. Trafilatura Hybrid: Trafilatura für saubere Texte, BS4 als sicheres Fallback
+
 v2.2.0 - Encoding Fix: UTF-8 first, Fallback auf deklariertes Encoding
-         Behebt kaputte Umlaute bei deutschen Seiten (ü → 眉 etc.)
 v2.1.0 - Batch Limit 15, Semaphore(8)
 v2.0.0 - httpx Standard, Playwright Fallback, PDF Support
 """
@@ -14,12 +18,14 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup, NavigableString
 from pydantic import BaseModel
 from typing import List, Optional
+from urllib.parse import urljoin
 import asyncio
 import httpx
 import logging
 import re
 import tempfile
 import os
+import trafilatura
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +57,10 @@ async def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
+
+# =============================================================================
+# PDF DETECTION + EXTRACTION
+# =============================================================================
 
 def is_pdf_url(url: str) -> bool:
     url_lower = url.lower().strip()
@@ -108,12 +118,12 @@ def pdf_text_to_markdown(text: str, url: str) -> str:
     return markdown.strip()
 
 
+# =============================================================================
+# ENCODING FIX (v2.2.0)
+# =============================================================================
+
 def decode_response(r: httpx.Response) -> str:
-    """
-    v2.2.0: Encoding Fix für deutsche Umlaute.
-    UTF-8 first — viele Seiten deklarieren latin-1 aber senden UTF-8.
-    Fallback auf deklariertes Encoding, dann latin-1.
-    """
+    """UTF-8 first — viele Seiten deklarieren latin-1 aber senden UTF-8."""
     try:
         return r.content.decode("utf-8")
     except UnicodeDecodeError:
@@ -127,6 +137,10 @@ def decode_response(r: httpx.Response) -> str:
 
     return r.content.decode("latin-1", errors="replace")
 
+
+# =============================================================================
+# HTML FETCHING
+# =============================================================================
 
 async def fetch_html_fast(url: str) -> Optional[str]:
     client = await get_http_client()
@@ -226,7 +240,12 @@ def needs_javascript(html: str) -> bool:
     return False
 
 
-def html_to_markdown(html: str, url: str = "") -> str:
+# =============================================================================
+# HTML → MARKDOWN: BS4 FALLBACK (v2.3.0: relative links + colspan fix)
+# =============================================================================
+
+def html_to_markdown_bs4(html: str, url: str = "") -> str:
+    """BS4-basierte Markdown-Konvertierung — sicheres Fallback."""
     soup = BeautifulSoup(html, "html.parser")
 
     for tag in soup(["script", "style", "nav", "footer", "header",
@@ -248,7 +267,7 @@ def html_to_markdown(html: str, url: str = "") -> str:
     )
 
     lines = []
-    _convert_element(main_content, lines)
+    _convert_element(main_content, lines, url=url)
 
     markdown = "\n".join(lines)
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
@@ -256,7 +275,38 @@ def html_to_markdown(html: str, url: str = "") -> str:
     return markdown.strip()
 
 
-def _convert_element(element, lines: list, depth: int = 0):
+def html_to_markdown(html: str, url: str = "") -> str:
+    """
+    v2.3.0: Trafilatura Hybrid-Weiche.
+    Trafilatura für saubere Texte (70-80% der Fälle),
+    BS4 als sicheres Fallback wenn Trafilatura zu wenig extrahiert.
+    """
+    # 1. Trafilatura versuchen
+    try:
+        traf_markdown = trafilatura.extract(
+            html,
+            include_links=True,
+            include_tables=True,
+            include_formatting=True,
+            output_format="markdown"
+        )
+
+        # 2. Qualitäts-Check: mind. 40 Wörter Kerninhalt
+        if traf_markdown:
+            word_count = len(traf_markdown.split())
+            if word_count >= 40:
+                logger.info(f"⚡ Trafilatura erfolgreich: {url} ({word_count} Wörter)")
+                return re.sub(r"\n{3,}", "\n\n", traf_markdown).strip()
+
+    except Exception as e:
+        logger.warning(f"⚠️ Trafilatura Fehler für {url}: {str(e)}")
+
+    # 3. BS4 Fallback
+    logger.info(f"🛡️ BS4 Fallback aktiv für: {url}")
+    return html_to_markdown_bs4(html, url)
+
+
+def _convert_element(element, lines: list, depth: int = 0, url: str = ""):
     if isinstance(element, NavigableString):
         text = str(element).strip()
         if text:
@@ -297,6 +347,11 @@ def _convert_element(element, lines: list, depth: int = 0):
     if tag == "a":
         text = element.get_text(" ", strip=True)
         href = element.get("href", "").strip()
+
+        # FIX 1 (v2.3.0): Relative Links zu absoluten Links machen
+        if href and url:
+            href = urljoin(url, href)
+
         if text and href and href.startswith("http"):
             lines.append(f"[{text}]({href})")
         elif text:
@@ -324,7 +379,7 @@ def _convert_element(element, lines: list, depth: int = 0):
         return
 
     for child in element.children:
-        _convert_element(child, lines, depth + 1)
+        _convert_element(child, lines, depth + 1, url=url)
 
 
 def _convert_table(table_element) -> str:
@@ -340,17 +395,27 @@ def _convert_table(table_element) -> str:
         if not cells:
             continue
 
-        cell_texts = [cell.get_text(" ", strip=True).replace("|", "\\|") for cell in cells]
+        # FIX 2 (v2.3.0): Colspan berücksichtigen — verbundene Zellen auffüllen
+        cell_texts = []
+        for cell in cells:
+            text = cell.get_text(" ", strip=True).replace("|", "\\|")
+            colspan = int(cell.get("colspan", 1))
+            cell_texts.extend([text] * colspan)
+
         row_str = "| " + " | ".join(cell_texts) + " |"
         markdown_rows.append(row_str)
 
         if row_idx == 0 and not separator_added:
-            separator = "| " + " | ".join(["---"] * len(cells)) + " |"
+            separator = "| " + " | ".join(["---"] * len(cell_texts)) + " |"
             markdown_rows.append(separator)
             separator_added = True
 
     return "\n".join(markdown_rows) if markdown_rows else ""
 
+
+# =============================================================================
+# QUALITY SCORING
+# =============================================================================
 
 def calculate_quality_score(markdown: str) -> dict:
     score = 0
@@ -397,6 +462,10 @@ def calculate_quality_score(markdown: str) -> dict:
 
     return details
 
+
+# =============================================================================
+# MAIN FETCH FUNCTION
+# =============================================================================
 
 async def fetch_and_convert(url: str) -> dict:
     if is_pdf_url(url):
@@ -458,6 +527,7 @@ async def fetch_and_convert(url: str) -> dict:
         if pw_html:
             html = pw_html
 
+    # v2.3.0: Trafilatura Hybrid statt direktem BS4-Aufruf
     markdown = html_to_markdown(html, url)
     quality = calculate_quality_score(markdown)
 
@@ -469,6 +539,10 @@ async def fetch_and_convert(url: str) -> dict:
         "success": True, "error": None
     }
 
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
 
 @router.get("/fetch-markdown")
 async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetch and convert to Markdown")):
@@ -498,7 +572,7 @@ class BatchRequest(BaseModel):
 async def fetch_markdown_batch(request: BatchRequest):
     """
     BATCH ENDPOINT – bis zu 15 URLs parallel
-    v2.2.0: Encoding Fix für deutsche Umlaute
+    v2.3.0: Trafilatura Hybrid + Relative Links Fix + Colspan Fix
     """
     if not request.urls:
         raise HTTPException(status_code=400, detail="urls list is required")

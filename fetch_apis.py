@@ -7,10 +7,9 @@ Schreibt DIREKT in data_group_b_finanzen (kein Umweg über discovered_urls/WF2)
 Unterstützt: World Bank, BLS (USA)
 Erweiterbar für: Eurostat, EIA, College Scorecard
 
-v2.2.0 – 2026-03-09
-FIX: source_field / date_field verwenden jetzt vollen db_field Namen inkl. Suffix
-     DB-Spalten wurden umbenannt: visa_tourist_max_days_num_source (nicht mehr _source ohne _num)
-     DB = ACF = WF3 jetzt überall konsistent
+v2.3.0 – 2026-03-16
+FIX: country_codes Filter wird jetzt direkt in Supabase-Query angewendet
+     Beide Branches (fetch_all_active / country_codes) haben eigene optimierte Queries
 """
 
 from fastapi import APIRouter
@@ -217,10 +216,6 @@ async def process_country(country: dict, api_rules: List[dict]) -> dict:
 
     for rule, raw_value in zip(relevant_rules, raw_values):
         db_field = rule["db_field"]
-
-        # FIX v2.2: DB-Spalten haben jetzt vollen Namen inkl. Typ-Suffix
-        # z.B. cost_living_excl_rent_tier1_month_usd_num → _num_source / _num_date
-        # Kein Suffix-Stripping mehr nötig – DB = ACF = WF3 konsistent
         source_field = db_field + "_source"
         date_field   = db_field + "_date"
 
@@ -302,50 +297,52 @@ async def fetch_apis(request: FetchApisRequest):
     Option B: { "fetch_all_active": true }           → alle aktiven Länder
     """
 
+    if not request.fetch_all_active and not request.country_codes:
+        return {"success": False, "error": "Provide either 'country_codes' or 'fetch_all_active': true"}
+
+    # -------------------------------------------------------------------------
+    # Länder laden — optimierte Queries je nach Modus
+    # -------------------------------------------------------------------------
     try:
-        if request.fetch_all_active:
-            rules_countries_resp = supabase.table("config_rules").select(
-                "country_name"
-            ).eq("active", True).execute()
-        elif request.country_codes:
-            rules_countries_resp = supabase.table("config_rules").select(
-                "country_name"
-            ).eq("active", True).execute()
-        else:
-            return {"success": False, "error": "Provide either 'country_codes' or 'fetch_all_active': true"}
+        query = supabase.table("config_rules").select("rule_id, country_name").eq("active", True)
 
-        all_names = list({r["country_name"] for r in rules_countries_resp.data})
+        if request.country_codes:
+            # FIX v2.3: Filter direkt in Supabase-Query — nicht erst in der Loop
+            query = query.in_("country_code", request.country_codes)
 
-        rules_resp_full = supabase.table("config_rules").select(
-            "rule_id, country_name"
-        ).eq("active", True).execute()
+        rules_resp = query.execute()
 
-        name_to_code = {}
-        for r in rules_resp_full.data:
+        if not rules_resp.data:
+            return {"success": False, "error": "Keine aktiven Länder gefunden"}
+
+        # country_code aus rule_id extrahieren (Format: "DE-VISA", "US-COSTS" etc.)
+        countries = []
+        seen_codes = set()
+
+        for r in rules_resp.data:
             rule_id = r["rule_id"]
             country_name = r["country_name"]
-            if "-" in rule_id:
-                code = rule_id.split("-")[0]
-                name_to_code[country_name] = code
 
-        countries = []
-        for name in all_names:
-            code = name_to_code.get(name)
-            if not code:
+            if "-" not in rule_id:
                 continue
-            if request.country_codes and code not in request.country_codes:
+
+            country_code = rule_id.split("-")[0]
+
+            if country_code in seen_codes:
                 continue
+            seen_codes.add(country_code)
+
             countries.append({
-                "country_code": code,
-                "country_name": name,
-                "iso2": code,
-                "worldbank_id": code,
+                "country_code": country_code,
+                "country_name": country_name,
+                "iso2": country_code,
+                "worldbank_id": country_code,
                 "eurostat_geo": None,
-                "bls_available": code == "US"
+                "bls_available": country_code == "US"
             })
 
         if not countries:
-            return {"success": False, "error": "Keine aktiven Länder gefunden"}
+            return {"success": False, "error": "Keine Länder nach Filterung übrig"}
 
         logger.info(f"📋 {len(countries)} Länder: {[c['country_code'] for c in countries]}")
 
@@ -353,6 +350,9 @@ async def fetch_apis(request: FetchApisRequest):
         logger.error(f"❌ Länder-Abfrage fehlgeschlagen: {e}")
         return {"success": False, "error": str(e)}
 
+    # -------------------------------------------------------------------------
+    # API-Regeln laden
+    # -------------------------------------------------------------------------
     try:
         rules_resp = supabase.table("config_apis").select("*").eq("active", True).execute()
         api_rules = [r for r in rules_resp.data if r.get("target_table") == "data_group_b_finanzen"]
@@ -366,6 +366,9 @@ async def fetch_apis(request: FetchApisRequest):
         logger.error(f"❌ config_apis Abfrage fehlgeschlagen: {e}")
         return {"success": False, "error": str(e)}
 
+    # -------------------------------------------------------------------------
+    # Länder verarbeiten
+    # -------------------------------------------------------------------------
     results = []
     for country in countries:
         result = await process_country(country, api_rules)

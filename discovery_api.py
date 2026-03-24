@@ -10,6 +10,8 @@ v2.2.0 - Dynamic Keywords
 v2.3.0 - Smarter JS Detection
 v2.3.1 - BUEROKRATIE Fix: Umlaut aus target_group entfernt (Encoding-Kompatibilität)
          GROUP F: BÜROKRATIE → GROUP F: BUEROKRATIE in allen Fallback-Maps
+v2.4.0 - Status Fix: Neue URLs bekommen status='discovered' statt 'pending'
+         damit WF1b sauber filtern kann und kein Endlosloop entsteht
 """
 
 from fastapi import FastAPI, HTTPException
@@ -37,7 +39,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.3.1"
+    version="2.4.0"
 )
 
 app.add_middleware(
@@ -692,7 +694,7 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
             "country_code": url_data["country_code"],
             "country_name": url_data["country_name"],
             "target_group": url_data["target_group"],
-            "status": "pending"
+            "status": "discovered"
         })
 
     if duplicates_removed > 0:
@@ -753,9 +755,9 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.3.1",
+        "version": "2.4.0",
         "status": "running",
-        "changes_v2.3.1": "BUEROKRATIE fix — Umlaut aus target_group entfernt"
+        "changes_v2.4.0": "Status fix — neue URLs bekommen status=discovered statt pending"
     }
 
 
@@ -763,7 +765,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.3.1",
+        "version": "2.4.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -809,7 +811,7 @@ async def run_discovery(request: DiscoveryRequest):
     clear_keywords_cache()
 
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.3.1")
+    logger.info(f"🚀 DISCOVERY API v2.4.0")
     logger.info("=" * 80)
 
     try:
@@ -887,7 +889,7 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.3.1...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.4.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info("✅ API is ready!")

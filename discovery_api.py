@@ -14,6 +14,8 @@ v2.4.0 - Status Fix: Neue URLs bekommen status='discovered' statt 'pending'
          damit WF1b sauber filtern kann und kein Endlosloop entsteht
 v2.5.0 - PDF Discovery Fix: /pdf/, /download/, .doc, .xls aus BLOCKED_PATH_PATTERNS entfernt
          damit Gebührentabellen und offizielle Dokumente gecrawlt werden
+v2.6.0 - Chunked Protection Fix: URLs mit status='chunked' werden beim upsert nicht
+         überschrieben — nur neue URLs werden eingefügt, chunked URLs bleiben unangetastet
 """
 
 from fastapi import FastAPI, HTTPException
@@ -41,7 +43,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.5.0"
+    version="2.6.0"
 )
 
 app.add_middleware(
@@ -558,7 +560,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         nonlocal playwright_instance, playwright_browser
 
         async with semaphore:
-            # PDF-URLs direkt an fetch_markdown übergeben, kein HTML-Parsing nötig
             url_lower = url.lower()
             is_pdf = url_lower.endswith(".pdf") or ".pdf?" in url_lower
 
@@ -720,6 +721,27 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     if duplicates_removed > 0:
         logger.info(f"🧹 Removed {duplicates_removed} duplicate URLs from batch")
 
+    # ==========================================================================
+    # v2.6.0 FIX: Chunked URLs vor dem upsert rausfiltern
+    # URLs mit status='chunked' wurden bereits von WF2 verarbeitet und dürfen
+    # nicht überschrieben werden — nur neue oder discovered/pending URLs updaten
+    # ==========================================================================
+    try:
+        all_urls = [d["url"] for d in insert_data]
+        existing = supabase.table("discovered_urls").select("url, status").in_("url", all_urls).execute()
+        chunked_urls = {row["url"] for row in existing.data if row["status"] == "chunked"}
+
+        if chunked_urls:
+            logger.info(f"🔒 Skipping {len(chunked_urls)} already chunked URLs — nicht überschreiben")
+            insert_data = [d for d in insert_data if d["url"] not in chunked_urls]
+
+    except Exception as e:
+        logger.warning(f"⚠️ Could not check existing statuses: {str(e)}")
+
+    if not insert_data:
+        logger.info("✅ No new URLs to save (all already chunked)")
+        return 0
+
     try:
         response = supabase.table("discovered_urls").upsert(insert_data, on_conflict="url").execute()
         inserted_count = len(response.data) if response.data else 0
@@ -775,9 +797,9 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "status": "running",
-        "changes_v2.5.0": "PDF Discovery Fix — /pdf/, /download/, .doc, .xls aus BLOCKED_PATH_PATTERNS entfernt"
+        "changes_v2.6.0": "Chunked Protection Fix — URLs mit status=chunked werden beim upsert nicht überschrieben"
     }
 
 
@@ -785,7 +807,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -831,7 +853,7 @@ async def run_discovery(request: DiscoveryRequest):
     clear_keywords_cache()
 
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.5.0")
+    logger.info(f"🚀 DISCOVERY API v2.6.0")
     logger.info("=" * 80)
 
     try:
@@ -909,7 +931,7 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.5.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.6.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
     logger.info("✅ API is ready!")

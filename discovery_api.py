@@ -16,6 +16,8 @@ v2.5.0 - PDF Discovery Fix: /pdf/, /download/, .doc, .xls aus BLOCKED_PATH_PATTE
          damit Gebührentabellen und offizielle Dokumente gecrawlt werden
 v2.6.0 - Chunked Protection Fix: URLs mit status='chunked' werden beim upsert nicht
          überschrieben — nur neue URLs werden eingefügt, chunked URLs bleiben unangetastet
+v2.7.0 - Parallelisierung: Rules werden parallel verarbeitet (max MAX_PARALLEL_RULES gleichzeitig)
+         CONCURRENT_LIMIT pro Rule reduziert damit der Server nicht crasht
 """
 
 from fastapi import FastAPI, HTTPException
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.6.0"
+    version="2.7.0"
 )
 
 app.add_middleware(
@@ -75,7 +77,13 @@ EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
 # CRAWLING CONFIG
 # =============================================================================
 
-CONCURRENT_LIMIT = 10
+# v2.7.0: Reduziert von 10 → 5, da mehrere Rules parallel laufen
+# Bei MAX_PARALLEL_RULES=3 → max ~15 gleichzeitige Requests gesamt
+CONCURRENT_LIMIT = 5
+
+# v2.7.0: Maximale Anzahl parallel laufender Rules (CX33: 4 vCPUs, 8GB RAM)
+MAX_PARALLEL_RULES = 3
+
 MAX_RETRIES = 3
 RETRY_DELAYS = [1, 3, 5]
 
@@ -435,8 +443,8 @@ async def get_http_client() -> httpx.AsyncClient:
             timeout=20,
             follow_redirects=True,
             limits=httpx.Limits(
-                max_connections=CONCURRENT_LIMIT + 5,
-                max_keepalive_connections=CONCURRENT_LIMIT,
+                max_connections=CONCURRENT_LIMIT * MAX_PARALLEL_RULES + 5,
+                max_keepalive_connections=CONCURRENT_LIMIT * MAX_PARALLEL_RULES,
             ),
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -656,7 +664,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
         if not batch:
             break
 
-        logger.info(f"🔎 Batch: {len(batch)} Seiten parallel (gesamt: {len(visited)}/{max_pages})")
+        logger.info(f"🔎 [{rule['rule_id']}] Batch: {len(batch)} Seiten (gesamt: {len(visited)}/{max_pages})")
 
         tasks = [process_page(url, depth) for url, depth in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -681,7 +689,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     if playwright_instance:
         await playwright_instance.stop()
 
-    logger.info(f"✅ Discovery complete: {len(discovered_urls)} URLs found (visited {len(visited)} pages)")
+    logger.info(f"✅ [{rule['rule_id']}] Discovery complete: {len(discovered_urls)} URLs (visited {len(visited)} pages)")
     return discovered_urls
 
 
@@ -797,9 +805,9 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.6.0",
+        "version": "2.7.0",
         "status": "running",
-        "changes_v2.6.0": "Chunked Protection Fix — URLs mit status=chunked werden beim upsert nicht überschrieben"
+        "changes_v2.7.0": "Parallelisierung: Rules werden parallel verarbeitet (max 3 gleichzeitig), CONCURRENT_LIMIT pro Rule auf 5 reduziert"
     }
 
 
@@ -807,7 +815,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.6.0",
+        "version": "2.7.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -853,7 +861,7 @@ async def run_discovery(request: DiscoveryRequest):
     clear_keywords_cache()
 
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.6.0")
+    logger.info(f"🚀 DISCOVERY API v2.7.0 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
     logger.info("=" * 80)
 
     try:
@@ -883,33 +891,46 @@ async def run_discovery(request: DiscoveryRequest):
         if skipped > 0:
             logger.info(f"⏭️ Skipped {skipped} GROUP B rules")
 
-        total_urls_found = 0
+        logger.info(f"📋 {len(rules)} Rules werden verarbeitet (max {MAX_PARALLEL_RULES} parallel, {CONCURRENT_LIMIT} URLs/Rule)")
+
+        # ======================================================================
+        # v2.7.0: Parallelisierung mit Rule-Semaphore
+        # MAX_PARALLEL_RULES gleichzeitig → schützt RAM auf CX33 (8GB)
+        # ======================================================================
+        rule_semaphore = asyncio.Semaphore(MAX_PARALLEL_RULES)
         results_per_rule = []
+        results_lock = asyncio.Lock()
+        total_urls_found = 0
 
-        for i, rule in enumerate(rules, 1):
-            logger.info(f"📍 Rule {i}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
+        async def process_rule(rule: Dict, index: int) -> Dict:
+            async with rule_semaphore:
+                logger.info(f"▶️  Rule {index}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
+                try:
+                    if request.max_urls:
+                        rule['max_urls'] = request.max_urls
 
-            try:
-                if request.max_urls:
-                    rule['max_urls'] = request.max_urls
+                    discovered_urls = await discover_urls(rule)
+                    saved_count = save_urls_to_supabase(discovered_urls)
+                    update_last_crawled(rule['rule_id'])
 
-                discovered_urls = await discover_urls(rule)
-                saved_count = save_urls_to_supabase(discovered_urls)
-                update_last_crawled(rule['rule_id'])
+                    logger.info(f"✅ Rule {rule['rule_id']} fertig: {saved_count} URLs gespeichert")
+                    return {
+                        "rule_id": rule['rule_id'], "country": rule['country_name'],
+                        "target_group": rule['target_group'], "urls_found": saved_count, "success": True
+                    }
 
-                total_urls_found += saved_count
-                results_per_rule.append({
-                    "rule_id": rule['rule_id'], "country": rule['country_name'],
-                    "target_group": rule['target_group'], "urls_found": saved_count, "success": True
-                })
+                except Exception as e:
+                    logger.error(f"❌ Fehler bei Rule {rule['rule_id']}: {str(e)}")
+                    return {
+                        "rule_id": rule['rule_id'], "country": rule['country_name'],
+                        "target_group": rule.get('target_group', 'unknown'),
+                        "urls_found": 0, "success": False, "error": str(e)
+                    }
 
-            except Exception as e:
-                logger.error(f"❌ Error processing rule {rule['rule_id']}: {str(e)}")
-                results_per_rule.append({
-                    "rule_id": rule['rule_id'], "country": rule['country_name'],
-                    "target_group": rule.get('target_group', 'unknown'),
-                    "urls_found": 0, "success": False, "error": str(e)
-                })
+        # Alle Rules parallel starten (Semaphore regelt max. Gleichzeitigkeit)
+        tasks = [process_rule(rule, i) for i, rule in enumerate(rules, 1)]
+        results_per_rule = await asyncio.gather(*tasks)
+        total_urls_found = sum(r['urls_found'] for r in results_per_rule)
 
         return DiscoveryResponse(
             success=True,
@@ -917,7 +938,7 @@ async def run_discovery(request: DiscoveryRequest):
             total_urls_found=total_urls_found,
             successful_rules=sum(1 for r in results_per_rule if r['success']),
             failed_rules=sum(1 for r in results_per_rule if not r['success']),
-            results_per_rule=results_per_rule
+            results_per_rule=list(results_per_rule)
         )
 
     except Exception as e:
@@ -931,9 +952,10 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.6.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.7.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
-    logger.info(f"⚡ Concurrent limit: {CONCURRENT_LIMIT}")
+    logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
+    logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
     logger.info("✅ API is ready!")
 
 

@@ -18,6 +18,9 @@ v2.6.0 - Chunked Protection Fix: URLs mit status='chunked' werden beim upsert ni
          überschrieben — nur neue URLs werden eingefügt, chunked URLs bleiben unangetastet
 v2.7.0 - Parallelisierung: Rules werden parallel verarbeitet (max MAX_PARALLEL_RULES gleichzeitig)
          CONCURRENT_LIMIT pro Rule reduziert damit der Server nicht crasht
+v2.7.1 - Domain Block Detection: Fehlerzähler pro Domain — nach DOMAIN_FAIL_THRESHOLD
+         gescheiterten URLs wird die Domain für den Rest des Crawls übersprungen.
+         Zähler wird nur beim letzten fehlgeschlagenen Versuch erhöht (nicht pro Retry).
 """
 
 from fastapi import FastAPI, HTTPException
@@ -45,7 +48,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.7.0"
+    version="2.7.1"
 )
 
 app.add_middleware(
@@ -84,8 +87,11 @@ CONCURRENT_LIMIT = 5
 # v2.7.0: Maximale Anzahl parallel laufender Rules (CX33: 4 vCPUs, 8GB RAM)
 MAX_PARALLEL_RULES = 3
 
-MAX_RETRIES = 3
-RETRY_DELAYS = [1, 3, 5]
+MAX_RETRIES = 2
+RETRY_DELAYS = [1, 3]
+
+# v2.7.1: Nach dieser Anzahl gescheiterter URLs wird die Domain übersprungen
+DOMAIN_FAIL_THRESHOLD = 3
 
 IGNORED_QUERY_PARAMS = [
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
@@ -253,6 +259,12 @@ def is_internal(url: str, base_domain: str) -> bool:
 def is_blocked_path(url: str) -> bool:
     path_lower = urlparse(url).path.lower()
     return any(blocked in path_lower for blocked in BLOCKED_PATH_PATTERNS)
+
+
+def get_domain(url: str) -> str:
+    """Extrahiert die Basis-Domain aus einer URL. z.B. 'canada.ca'"""
+    ext = tldextract.extract(url)
+    return f"{ext.domain}.{ext.suffix}"
 
 
 def extract_main_content(soup: BeautifulSoup) -> str:
@@ -457,7 +469,21 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-async def fetch_html_fast(url: str) -> Optional[str]:
+async def fetch_html_fast(url: str, domain_fails: Dict[str, int]) -> Optional[str]:
+    """
+    Fetcht HTML einer URL mit Retry-Logik und Domain Block Detection.
+
+    v2.7.1: domain_fails Zähler wird nur beim letzten fehlgeschlagenen
+    Versuch erhöht — nicht bei jedem einzelnen Retry. So entspricht
+    1 gescheiterte URL = 1 Fehler für die Domain.
+    """
+    domain = get_domain(url)
+
+    # Domain bereits geblockt → sofort skippen
+    if domain_fails.get(domain, 0) >= DOMAIN_FAIL_THRESHOLD:
+        logger.info(f"⛔ Domain geblockt, skip: {domain} ({url})")
+        return None
+
     client = await get_http_client()
 
     for attempt in range(MAX_RETRIES):
@@ -465,12 +491,26 @@ async def fetch_html_fast(url: str) -> Optional[str]:
             r = await client.get(url)
             if r.status_code == 200:
                 return r.text
-            elif r.status_code in (429, 503, 502):
+            elif r.status_code in (403, 429):
+                # Klares Blocksignal → kein Retry, sofort zählen
+                domain_fails[domain] = domain_fails.get(domain, 0) + 1
+                logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
+                if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
+                    logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
+                return None
+            elif r.status_code in (503, 502):
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_DELAYS[attempt]
                     logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} (Status {r.status_code})")
                     await asyncio.sleep(delay)
                     continue
+                else:
+                    # Letzter Versuch gescheitert → jetzt zählen
+                    domain_fails[domain] = domain_fails.get(domain, 0) + 1
+                    logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
+                    if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
+                        logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
+                    return None
             else:
                 logger.warning(f"⚠️ httpx Status {r.status_code} für {url}")
                 return None
@@ -481,7 +521,11 @@ async def fetch_html_fast(url: str) -> Optional[str]:
                 await asyncio.sleep(delay)
                 continue
             else:
-                logger.warning(f"⚠️ httpx Fehler nach {MAX_RETRIES} Versuchen für {url}: {str(e)}")
+                # Letzter Versuch gescheitert → jetzt zählen
+                domain_fails[domain] = domain_fails.get(domain, 0) + 1
+                logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} ({type(e).__name__})")
+                if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
+                    logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
                 return None
         except Exception as e:
             logger.warning(f"⚠️ httpx Fehler für {url}: {str(e)}")
@@ -538,6 +582,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     playwright_instance = None
     playwright_browser = None
 
+    # v2.7.1: Fehlerzähler pro Domain — frisch pro Rule
+    domain_fails: Dict[str, int] = {}
+
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
     logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
 
@@ -585,7 +632,8 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     "target_group": rule['target_group']
                 }, None, [], []
 
-            html = await fetch_html_fast(url)
+            # v2.7.1: domain_fails weitergeben
+            html = await fetch_html_fast(url, domain_fails)
 
             needs_pw = html and needs_javascript(html)
 
@@ -805,9 +853,9 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.7.0",
+        "version": "2.7.1",
         "status": "running",
-        "changes_v2.7.0": "Parallelisierung: Rules werden parallel verarbeitet (max 3 gleichzeitig), CONCURRENT_LIMIT pro Rule auf 5 reduziert"
+        "changes_v2.7.1": "Domain Block Detection: Nach DOMAIN_FAIL_THRESHOLD gescheiterten URLs wird die Domain übersprungen. Zähler erhöht sich nur beim letzten fehlgeschlagenen Versuch."
     }
 
 
@@ -815,7 +863,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.7.0",
+        "version": "2.7.1",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -861,7 +909,7 @@ async def run_discovery(request: DiscoveryRequest):
     clear_keywords_cache()
 
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.7.0 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
+    logger.info(f"🚀 DISCOVERY API v2.7.1 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
     logger.info("=" * 80)
 
     try:
@@ -893,10 +941,6 @@ async def run_discovery(request: DiscoveryRequest):
 
         logger.info(f"📋 {len(rules)} Rules werden verarbeitet (max {MAX_PARALLEL_RULES} parallel, {CONCURRENT_LIMIT} URLs/Rule)")
 
-        # ======================================================================
-        # v2.7.0: Parallelisierung mit Rule-Semaphore
-        # MAX_PARALLEL_RULES gleichzeitig → schützt RAM auf CX33 (8GB)
-        # ======================================================================
         rule_semaphore = asyncio.Semaphore(MAX_PARALLEL_RULES)
         results_per_rule = []
         results_lock = asyncio.Lock()
@@ -927,7 +971,6 @@ async def run_discovery(request: DiscoveryRequest):
                         "urls_found": 0, "success": False, "error": str(e)
                     }
 
-        # Alle Rules parallel starten (Semaphore regelt max. Gleichzeitigkeit)
         tasks = [process_rule(rule, i) for i, rule in enumerate(rules, 1)]
         results_per_rule = await asyncio.gather(*tasks)
         total_urls_found = sum(r['urls_found'] for r in results_per_rule)
@@ -952,10 +995,11 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.7.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.7.1...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
+    logger.info(f"⚡ Domain fail threshold: {DOMAIN_FAIL_THRESHOLD}")
     logger.info("✅ API is ready!")
 
 

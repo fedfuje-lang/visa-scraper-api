@@ -21,6 +21,12 @@ v2.7.0 - Parallelisierung: Rules werden parallel verarbeitet (max MAX_PARALLEL_R
 v2.7.1 - Domain Block Detection: Fehlerzähler pro Domain — nach DOMAIN_FAIL_THRESHOLD
          gescheiterten URLs wird die Domain für den Rest des Crawls übersprungen.
          Zähler wird nur beim letzten fehlgeschlagenen Versuch erhöht (nicht pro Retry).
+v2.8.0 - Scoring komplett entfernt: score_url(), extract_topics(), GROUP_KEYWORDS,
+         GENERAL_KEYWORDS, load_keywords(), config_keywords-Abfrage — alles raus.
+         Embedding in WF6 übernimmt die Relevanzbeurteilung, kein Vorfilter mehr nötig.
+         Alle gecrawlten URLs landen in discovered_urls, nur BLOCKED_PATH_PATTERNS filtert.
+         Target URL garantiert gecrawlt: is_main_url=True, überspringt Domain-Block-Check.
+         is_main_url wird jetzt korrekt in Supabase gespeichert.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -35,7 +41,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 import os
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 import logging
 import xml.etree.ElementTree as ET
 
@@ -48,7 +54,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.7.1"
+    version="2.8.0"
 )
 
 app.add_middleware(
@@ -90,7 +96,8 @@ MAX_PARALLEL_RULES = 3
 MAX_RETRIES = 2
 RETRY_DELAYS = [1, 3]
 
-# v2.7.1: Nach dieser Anzahl gescheiterter URLs wird die Domain übersprungen
+# v2.7.1: Nach dieser Anzahl gescheiterter Sub-URLs wird die Domain übersprungen.
+# Gilt NICHT für target_urls — diese werden immer versucht (is_main_url=True).
 DOMAIN_FAIL_THRESHOLD = 3
 
 IGNORED_QUERY_PARAMS = [
@@ -117,116 +124,6 @@ BLOCKED_PATH_PATTERNS = [
     "/comment", "/reply",
     "#",
 ]
-
-# =============================================================================
-# FALLBACK KEYWORDS
-# v2.3.1: GROUP F: BÜROKRATIE → GROUP F: BUEROKRATIE
-# =============================================================================
-
-GROUP_KEYWORDS = {
-    "GROUP A: VISA & RECHT": [
-        "visa", "residence", "permit", "immigration", "documents",
-        "requirements", "processing", "application", "green card",
-        "citizenship", "work permit", "entry", "border", "consulate",
-        "embassy", "naturalization", "permanent residence", "asylum",
-        "refugee", "deportation", "overstay", "grace period",
-        "sponsorship", "petition", "adjustment of status", "i-140", "i-485",
-        "eb-1", "eb-2", "eb-3", "eb-5", "h-1b", "l-1", "o-1",
-        "legal status", "authorization", "immigration law", "attorney",
-        "lawyer", "appeal", "denial", "approval", "biometrics"
-    ],
-    "GROUP E: BILDUNG": [
-        "education", "school", "university", "college", "study",
-        "student", "degree", "diploma", "certificate", "course",
-        "program", "major", "bachelor", "master", "phd", "doctorate",
-        "tuition", "tuition fee", "scholarship", "grant", "financial aid",
-        "admission", "enrollment", "application", "requirements",
-        "international student", "exchange student", "language course",
-        "language school", "language test", "toefl", "ielts",
-        "kindergarten", "preschool", "elementary", "secondary",
-        "high school", "private school", "public school",
-        "international school", "curriculum", "semester", "academic year",
-        "grades", "transcript", "credits", "exam", "test",
-        "library", "campus", "dormitory", "student visa", "f-1",
-        "vocational training", "apprenticeship", "qualification recognition"
-    ],
-    "GROUP F: BUEROKRATIE": [
-        "registration", "register", "bureaucracy", "administration",
-        "office", "authority", "government", "municipal", "city hall",
-        "police registration", "residence registration", "anmeldung",
-        "form", "document", "certificate", "notary", "notarization",
-        "apostille", "authentication", "translation", "certified copy",
-        "passport", "id card", "identity document", "national id",
-        "driver license", "driving license", "international permit",
-        "vehicle registration", "car registration", "insurance",
-        "mandatory insurance", "social security number", "tax id",
-        "tax number", "tax office", "filing", "deadline",
-        "mobile phone", "sim card", "phone contract", "address",
-        "change of address", "utility contract", "electricity contract",
-        "shipping", "relocation", "moving", "customs", "import",
-        "export", "flight", "ticket", "travel document", "visa application fee"
-    ]
-}
-
-GENERAL_KEYWORDS = [
-    "immigrant", "expat", "foreigner", "international", "foreign national",
-    "non-citizen", "relocate", "relocation", "moving to", "living in",
-    "information", "guide", "how to", "requirements", "process", "procedure"
-]
-
-# =============================================================================
-# KEYWORD CACHE + load_keywords()
-# =============================================================================
-
-_keywords_cache: Dict[Tuple[str, str], Dict] = {}
-
-
-async def load_keywords(country_iso: str, target_group: str) -> Optional[Dict]:
-    cache_key = (country_iso, target_group)
-
-    if cache_key in _keywords_cache:
-        return _keywords_cache[cache_key]
-
-    try:
-        response = supabase.table("config_keywords").select(
-            "keyword, priority_weight, is_negative, match_type"
-        ).eq("target_group", target_group).in_(
-            "country_iso", ["ALL", country_iso]
-        ).execute()
-
-        if not response.data:
-            logger.warning(f"⚠️ Keine Keywords für ({country_iso}, {target_group}) — Fallback aktiv")
-            return None
-
-        positive = []
-        negative = []
-
-        for row in response.data:
-            entry = {
-                "keyword":    row["keyword"],
-                "weight":     row["priority_weight"],
-                "match_type": row["match_type"],
-            }
-            if row["is_negative"]:
-                negative.append(entry)
-            else:
-                positive.append(entry)
-
-        result = {"positive": positive, "negative": negative}
-        _keywords_cache[cache_key] = result
-
-        logger.info(f"📚 Keywords geladen ({country_iso}, {target_group}): {len(positive)} positiv, {len(negative)} negativ")
-        return result
-
-    except Exception as e:
-        logger.warning(f"⚠️ config_keywords Abfrage fehlgeschlagen ({country_iso}, {target_group}): {e} — Fallback aktiv")
-        return None
-
-
-def clear_keywords_cache():
-    global _keywords_cache
-    _keywords_cache = {}
-
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -262,7 +159,6 @@ def is_blocked_path(url: str) -> bool:
 
 
 def get_domain(url: str) -> str:
-    """Extrahiert die Basis-Domain aus einer URL. z.B. 'canada.ca'"""
     ext = tldextract.extract(url)
     return f"{ext.domain}.{ext.suffix}"
 
@@ -289,110 +185,6 @@ def extract_main_content(soup: BeautifulSoup) -> str:
 
 
 # =============================================================================
-# SCORE URL
-# =============================================================================
-
-def score_url(url: str, text: str, target_group: str,
-              keywords_config: Optional[Dict] = None) -> int:
-    score = 0
-    url_lower = url.lower()
-    text_lower = text.lower()
-    path_lower = urlparse(url).path.lower()
-
-    general_matches = sum(1 for kw in GENERAL_KEYWORDS if kw in url_lower or kw in text_lower)
-    score += min(general_matches, 2)
-
-    if keywords_config is not None:
-        for entry in keywords_config["positive"]:
-            kw         = entry["keyword"]
-            weight     = entry["weight"]
-            match_type = entry["match_type"]
-
-            if match_type in ("url", "both"):
-                if kw in path_lower:
-                    score += weight * 2
-                elif kw in url_lower:
-                    score += weight
-
-            if match_type in ("content", "both"):
-                if kw in text_lower:
-                    score += weight
-
-        for entry in keywords_config["negative"]:
-            kw         = entry["keyword"]
-            weight     = entry["weight"]
-            match_type = entry["match_type"]
-
-            hit = False
-            if match_type in ("url", "both") and kw in url_lower:
-                hit = True
-            if match_type in ("content", "both") and kw in text_lower:
-                hit = True
-            if hit:
-                score -= weight
-
-    else:
-        if target_group in GROUP_KEYWORDS:
-            group_kws = GROUP_KEYWORDS[target_group]
-
-            path_matches = sum(1 for kw in group_kws if kw in path_lower)
-            score += min(path_matches * 3, 6)
-
-            url_matches = sum(1 for kw in group_kws if kw in url_lower and kw not in path_lower)
-            score += min(url_matches, 2)
-
-            text_matches = sum(1 for kw in group_kws if kw in text_lower)
-            score += min(text_matches, 4)
-
-    if len(text) > 3000:
-        score += 2
-    elif len(text) > 1500:
-        score += 1
-    if len(text) < 200:
-        score = max(1, score - 2)
-
-    return max(1, min(score, 10))
-
-
-def extract_topics(text: str, url: str, target_group: str) -> List[str]:
-    topics = []
-    text_lower = text.lower()
-    url_lower = url.lower()
-
-    topic_maps = {
-        "GROUP A: VISA & RECHT": {
-            "tourist visa": ["tourist", "visitor", "b-2", "tourism"],
-            "work visa": ["work permit", "employment authorization", "h-1b", "l-1"],
-            "student visa": ["student", "f-1", "study"],
-            "green card": ["green card", "permanent residence", "eb-1", "eb-2"],
-            "citizenship": ["citizenship", "naturalization"],
-            "visa application": ["application", "form", "filing"],
-            "legal rights": ["legal", "rights", "law", "attorney"]
-        },
-        "GROUP E: BILDUNG": {
-            "universities": ["university", "college"],
-            "schools": ["school", "kindergarten", "elementary"],
-            "tuition fees": ["tuition", "fee", "scholarship"],
-            "admission": ["admission", "application", "enrollment"]
-        },
-        "GROUP F: BUEROKRATIE": {
-            "registration": ["registration", "anmeldung", "register"],
-            "documents": ["document", "certificate", "form"],
-            "id documents": ["passport", "id card"],
-            "driver license": ["driver license", "driving permit"]
-        }
-    }
-
-    if target_group in topic_maps:
-        topic_map = topic_maps[target_group]
-        for topic, keywords in topic_map.items():
-            if any(kw in text_lower or kw in url_lower for kw in keywords):
-                topics.append(topic)
-
-    return topics[:5]
-
-
-# =============================================================================
 # SITEMAP PARSER
 # =============================================================================
 
@@ -402,7 +194,7 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
 
     try:
         client = await get_http_client()
-        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.0)"})
+        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.8)"})
 
         if r.status_code != 200:
             return []
@@ -417,7 +209,7 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
             for sitemap_loc in sitemaps[:5]:
                 sub_url = sitemap_loc.text.strip()
                 try:
-                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.0)"})
+                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.8)"})
                     if sub_r.status_code == 200:
                         sub_root = ET.fromstring(sub_r.text)
                         sub_ns = ""
@@ -469,18 +261,18 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-async def fetch_html_fast(url: str, domain_fails: Dict[str, int]) -> Optional[str]:
+async def fetch_html_fast(url: str, domain_fails: Dict[str, int], is_target: bool = False) -> Optional[str]:
     """
     Fetcht HTML einer URL mit Retry-Logik und Domain Block Detection.
 
-    v2.7.1: domain_fails Zähler wird nur beim letzten fehlgeschlagenen
-    Versuch erhöht — nicht bei jedem einzelnen Retry. So entspricht
-    1 gescheiterte URL = 1 Fehler für die Domain.
+    v2.8.0: is_target=True überspringt den Domain-Block-Check vollständig.
+    Target URLs aus config_rules werden immer versucht, egal wie oft
+    andere URLs der gleichen Domain vorher gescheitert sind.
     """
     domain = get_domain(url)
 
-    # Domain bereits geblockt → sofort skippen
-    if domain_fails.get(domain, 0) >= DOMAIN_FAIL_THRESHOLD:
+    # Domain-Block gilt nicht für manuell konfigurierte target_urls
+    if not is_target and domain_fails.get(domain, 0) >= DOMAIN_FAIL_THRESHOLD:
         logger.info(f"⛔ Domain geblockt, skip: {domain} ({url})")
         return None
 
@@ -492,11 +284,13 @@ async def fetch_html_fast(url: str, domain_fails: Dict[str, int]) -> Optional[st
             if r.status_code == 200:
                 return r.text
             elif r.status_code in (403, 429):
-                # Klares Blocksignal → kein Retry, sofort zählen
-                domain_fails[domain] = domain_fails.get(domain, 0) + 1
-                logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
-                if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
-                    logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
+                if not is_target:
+                    domain_fails[domain] = domain_fails.get(domain, 0) + 1
+                    logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
+                    if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
+                        logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
+                else:
+                    logger.warning(f"⚠️ Target URL geblockt (Status {r.status_code}), kein Domain-Block: {url}")
                 return None
             elif r.status_code in (503, 502):
                 if attempt < MAX_RETRIES - 1:
@@ -505,11 +299,11 @@ async def fetch_html_fast(url: str, domain_fails: Dict[str, int]) -> Optional[st
                     await asyncio.sleep(delay)
                     continue
                 else:
-                    # Letzter Versuch gescheitert → jetzt zählen
-                    domain_fails[domain] = domain_fails.get(domain, 0) + 1
-                    logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
-                    if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
-                        logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
+                    if not is_target:
+                        domain_fails[domain] = domain_fails.get(domain, 0) + 1
+                        logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
+                        if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
+                            logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
                     return None
             else:
                 logger.warning(f"⚠️ httpx Status {r.status_code} für {url}")
@@ -521,11 +315,11 @@ async def fetch_html_fast(url: str, domain_fails: Dict[str, int]) -> Optional[st
                 await asyncio.sleep(delay)
                 continue
             else:
-                # Letzter Versuch gescheitert → jetzt zählen
-                domain_fails[domain] = domain_fails.get(domain, 0) + 1
-                logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} ({type(e).__name__})")
-                if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
-                    logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
+                if not is_target:
+                    domain_fails[domain] = domain_fails.get(domain, 0) + 1
+                    logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} ({type(e).__name__})")
+                    if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
+                        logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
                 return None
         except Exception as e:
             logger.warning(f"⚠️ httpx Fehler für {url}: {str(e)}")
@@ -564,6 +358,9 @@ def needs_javascript(html: str) -> bool:
 
 # =============================================================================
 # MAIN DISCOVERY FUNCTION
+# v2.8.0: Kein Scoring mehr. Alle gecrawlten URLs landen in discovered_urls.
+#         Einziger Filter: BLOCKED_PATH_PATTERNS + is_internal.
+#         Target URL wird immer gecrawlt (is_main_url=True, kein Domain-Block).
 # =============================================================================
 
 async def discover_urls(rule: Dict) -> List[Dict]:
@@ -582,14 +379,14 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     playwright_instance = None
     playwright_browser = None
 
-    # v2.7.1: Fehlerzähler pro Domain — frisch pro Rule
     domain_fails: Dict[str, int] = {}
+
+    normalized_start = normalize_url(start_url)
 
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
     logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
 
-    keywords_config = await load_keywords(country_iso, target_group)
-
+    # Sitemap als zusätzliche Seed-Quelle
     sitemap_urls = await fetch_sitemap_urls(start_url)
     if sitemap_urls:
         sitemap_filtered = [u for u in sitemap_urls if is_internal(u, base_domain) and not is_blocked_path(u)]
@@ -600,40 +397,39 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     to_visit = deque()
     to_visit_set = set()
 
+    # Sitemap-URLs in Queue
     for sm_url in sitemap_filtered[:max_pages]:
         normalized_sm = normalize_url(sm_url)
         if normalized_sm not in to_visit_set:
-            to_visit.append((normalized_sm, 0))
+            to_visit.append((normalized_sm, 0, False))
             to_visit_set.add(normalized_sm)
 
-    normalized_start = normalize_url(start_url)
+    # Target URL immer als erstes und mit is_target=True
     if normalized_start not in to_visit_set:
-        to_visit.appendleft((normalized_start, 0))
+        to_visit.appendleft((normalized_start, 0, True))
         to_visit_set.add(normalized_start)
 
-    async def process_page(url: str, depth: int) -> tuple:
+    async def process_page(url: str, depth: int, is_target: bool) -> tuple:
         nonlocal playwright_instance, playwright_browser
 
         async with semaphore:
             url_lower = url.lower()
             is_pdf = url_lower.endswith(".pdf") or ".pdf?" in url_lower
 
+            # PDFs direkt als URL speichern — kein HTML-Fetch nötig
             if is_pdf:
-                return url, depth, {
+                return url, depth, is_target, {
                     "url": url,
                     "page_title": url.split("/")[-1][:500],
-                    "relevance_score": 5,
-                    "topics": [],
+                    "is_main_url": is_target,
                     "discovered_depth": depth,
-                    "text_length": 0,
                     "rule_id": rule['rule_id'],
                     "country_code": rule['country_iso'],
                     "country_name": rule['country_name'],
                     "target_group": rule['target_group']
-                }, None, [], []
+                }, []
 
-            # v2.7.1: domain_fails weitergeben
-            html = await fetch_html_fast(url, domain_fails)
+            html = await fetch_html_fast(url, domain_fails, is_target=is_target)
 
             needs_pw = html and needs_javascript(html)
 
@@ -656,18 +452,29 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     )
                 html = await fetch_html_playwright(url, playwright_browser)
 
+            # Kein HTML → target_urls trotzdem als URL-Eintrag speichern
+            # damit WF1b sie später per fetch_markdown nochmal versuchen kann
             if not html:
-                return url, depth, None, None, [], []
+                if is_target:
+                    logger.warning(f"⚠️ Target URL konnte nicht geladen werden, trotzdem gespeichert: {url}")
+                    return url, depth, is_target, {
+                        "url": url,
+                        "page_title": "",
+                        "is_main_url": True,
+                        "discovered_depth": depth,
+                        "rule_id": rule['rule_id'],
+                        "country_code": rule['country_iso'],
+                        "country_name": rule['country_name'],
+                        "target_group": rule['target_group']
+                    }, []
+                return url, depth, is_target, None, []
 
             soup = BeautifulSoup(html, "html.parser")
-            text = extract_main_content(soup)
 
             title_tag = soup.find("title")
             page_title = title_tag.get_text(strip=True) if title_tag else ""
 
-            relevance = score_url(url, text, target_group, keywords_config)
-            topics = extract_topics(text, url, target_group)
-
+            # Child-Links extrahieren für weitere Crawling-Tiefe
             child_links = []
             if depth < max_depth:
                 for a_tag in soup.select("a[href]"):
@@ -681,40 +488,37 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
                         child_links.append(normalized_full)
 
-            result = None
-            if relevance >= 3:
-                result = {
-                    "url": url,
-                    "page_title": page_title[:500],
-                    "relevance_score": relevance,
-                    "topics": topics,
-                    "discovered_depth": depth,
-                    "text_length": len(text),
-                    "rule_id": rule['rule_id'],
-                    "country_code": rule['country_iso'],
-                    "country_name": rule['country_name'],
-                    "target_group": rule['target_group']
-                }
+            # v2.8.0: Kein Score-Filter mehr — alle gecrawlten URLs werden gespeichert
+            result = {
+                "url": url,
+                "page_title": page_title[:500],
+                "is_main_url": is_target,
+                "discovered_depth": depth,
+                "rule_id": rule['rule_id'],
+                "country_code": rule['country_iso'],
+                "country_name": rule['country_name'],
+                "target_group": rule['target_group']
+            }
 
-            return url, depth, result, text, child_links, topics
+            return url, depth, is_target, result, child_links
 
     while to_visit and len(visited) < max_pages:
         batch = []
         while to_visit and len(batch) < CONCURRENT_LIMIT:
-            url, depth = to_visit.popleft()
+            url, depth, is_target = to_visit.popleft()
             to_visit_set.discard(url)
             normalized = normalize_url(url)
             if normalized in visited or depth > max_depth:
                 continue
             visited.add(normalized)
-            batch.append((normalized, depth))
+            batch.append((normalized, depth, is_target))
 
         if not batch:
             break
 
         logger.info(f"🔎 [{rule['rule_id']}] Batch: {len(batch)} Seiten (gesamt: {len(visited)}/{max_pages})")
 
-        tasks = [process_page(url, depth) for url, depth in batch]
+        tasks = [process_page(url, depth, is_target) for url, depth, is_target in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for result in results:
@@ -722,14 +526,14 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 logger.error(f"⚠️ Batch-Fehler: {str(result)}")
                 continue
 
-            url, depth, url_data, text, child_links, topics = result
+            url, depth, is_target, url_data, child_links = result
 
             if url_data:
                 discovered_urls.append(url_data)
 
             for link in child_links:
                 if link not in visited and link not in to_visit_set and len(visited) + len(to_visit) < max_pages * 2:
-                    to_visit.append((link, depth + 1))
+                    to_visit.append((link, depth + 1, False))
                     to_visit_set.add(link)
 
     if playwright_browser:
@@ -762,26 +566,21 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
             continue
         seen_urls.add(url)
         insert_data.append({
-            "url": url,
-            "page_title": url_data["page_title"],
-            "relevance_score": url_data["relevance_score"],
-            "topics": url_data["topics"],
+            "url":              url,
+            "page_title":       url_data["page_title"],
+            "is_main_url":      url_data["is_main_url"],   # v2.8.0: jetzt korrekt gesetzt
             "discovered_depth": url_data["discovered_depth"],
-            "rule_id": url_data["rule_id"],
-            "country_code": url_data["country_code"],
-            "country_name": url_data["country_name"],
-            "target_group": url_data["target_group"],
-            "status": "discovered"
+            "rule_id":          url_data["rule_id"],
+            "country_code":     url_data["country_code"],
+            "country_name":     url_data["country_name"],
+            "target_group":     url_data["target_group"],
+            "status":           "discovered"
         })
 
     if duplicates_removed > 0:
         logger.info(f"🧹 Removed {duplicates_removed} duplicate URLs from batch")
 
-    # ==========================================================================
-    # v2.6.0 FIX: Chunked URLs vor dem upsert rausfiltern
-    # URLs mit status='chunked' wurden bereits von WF2 verarbeitet und dürfen
-    # nicht überschrieben werden — nur neue oder discovered/pending URLs updaten
-    # ==========================================================================
+    # v2.6.0: Chunked URLs nicht überschreiben
     try:
         all_urls = [d["url"] for d in insert_data]
         existing = supabase.table("discovered_urls").select("url, status").in_("url", all_urls).execute()
@@ -853,9 +652,14 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.7.1",
+        "version": "2.8.0",
         "status": "running",
-        "changes_v2.7.1": "Domain Block Detection: Nach DOMAIN_FAIL_THRESHOLD gescheiterten URLs wird die Domain übersprungen. Zähler erhöht sich nur beim letzten fehlgeschlagenen Versuch."
+        "changes_v2.8.0": [
+            "Scoring komplett entfernt — Embedding in WF6 übernimmt Relevanzbeurteilung",
+            "Alle gecrawlten URLs landen in discovered_urls, nur BLOCKED_PATH_PATTERNS filtert",
+            "Target URL garantiert gecrawlt: is_main_url=True, überspringt Domain-Block",
+            "is_main_url wird jetzt korrekt in Supabase gespeichert",
+        ]
     }
 
 
@@ -863,7 +667,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.7.1",
+        "version": "2.8.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -872,8 +676,6 @@ async def health():
 async def discover_direct(request: DirectDiscoveryRequest):
     if any(excluded in request.target_group for excluded in EXCLUDED_FROM_DISCOVERY):
         return DirectDiscoveryResponse(success=False, total_urls_found=0, urls=[])
-
-    clear_keywords_cache()
 
     logger.info("=" * 80)
     logger.info(f"🚀 DIRECT DISCOVERY: {request.country_name} ({request.country_code}) / {request.target_group}")
@@ -906,10 +708,8 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.post("/discover", response_model=DiscoveryResponse)
 async def run_discovery(request: DiscoveryRequest):
-    clear_keywords_cache()
-
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.7.1 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
+    logger.info(f"🚀 DISCOVERY API v2.8.0 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
     logger.info("=" * 80)
 
     try:
@@ -942,9 +742,6 @@ async def run_discovery(request: DiscoveryRequest):
         logger.info(f"📋 {len(rules)} Rules werden verarbeitet (max {MAX_PARALLEL_RULES} parallel, {CONCURRENT_LIMIT} URLs/Rule)")
 
         rule_semaphore = asyncio.Semaphore(MAX_PARALLEL_RULES)
-        results_per_rule = []
-        results_lock = asyncio.Lock()
-        total_urls_found = 0
 
         async def process_rule(rule: Dict, index: int) -> Dict:
             async with rule_semaphore:
@@ -959,16 +756,22 @@ async def run_discovery(request: DiscoveryRequest):
 
                     logger.info(f"✅ Rule {rule['rule_id']} fertig: {saved_count} URLs gespeichert")
                     return {
-                        "rule_id": rule['rule_id'], "country": rule['country_name'],
-                        "target_group": rule['target_group'], "urls_found": saved_count, "success": True
+                        "rule_id":      rule['rule_id'],
+                        "country":      rule['country_name'],
+                        "target_group": rule['target_group'],
+                        "urls_found":   saved_count,
+                        "success":      True
                     }
 
                 except Exception as e:
                     logger.error(f"❌ Fehler bei Rule {rule['rule_id']}: {str(e)}")
                     return {
-                        "rule_id": rule['rule_id'], "country": rule['country_name'],
+                        "rule_id":      rule['rule_id'],
+                        "country":      rule['country_name'],
                         "target_group": rule.get('target_group', 'unknown'),
-                        "urls_found": 0, "success": False, "error": str(e)
+                        "urls_found":   0,
+                        "success":      False,
+                        "error":        str(e)
                     }
 
         tasks = [process_rule(rule, i) for i, rule in enumerate(rules, 1)]
@@ -995,11 +798,11 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.7.1...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.8.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
-    logger.info(f"⚡ Domain fail threshold: {DOMAIN_FAIL_THRESHOLD}")
+    logger.info(f"⚡ Domain fail threshold (Sub-URLs): {DOMAIN_FAIL_THRESHOLD}")
     logger.info("✅ API is ready!")
 
 

@@ -27,6 +27,10 @@ v2.8.0 - Scoring komplett entfernt: score_url(), extract_topics(), GROUP_KEYWORD
          Alle gecrawlten URLs landen in discovered_urls, nur BLOCKED_PATH_PATTERNS filtert.
          Target URL garantiert gecrawlt: is_main_url=True, überspringt Domain-Block-Check.
          is_main_url wird jetzt korrekt in Supabase gespeichert.
+v2.9.0 - Same-Day Protection: Rules die heute bereits gecrawlt wurden (last_crawled_at
+         >= Tagesbeginn UTC) werden übersprungen. Kein doppeltes Crawlen am selben Tag.
+         Erneutes Crawlen am nächsten Tag oder später ist weiterhin möglich.
+         Nie gecrawlte Rules (last_crawled_at IS NULL) werden immer verarbeitet.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -44,6 +48,7 @@ import os
 from typing import Optional, List, Dict
 import logging
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 from fetch_markdown import router as fetch_markdown_router
 from fetch_apis import router as fetch_apis_router
@@ -54,7 +59,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.8.0"
+    version="2.9.0"
 )
 
 app.add_middleware(
@@ -185,6 +190,20 @@ def extract_main_content(soup: BeautifulSoup) -> str:
 
 
 # =============================================================================
+# v2.9.0: SAME-DAY PROTECTION HELPER
+# =============================================================================
+
+def get_today_start_utc() -> str:
+    """
+    Gibt den Tagesbeginn (00:00:00 UTC) als ISO-String zurück.
+    Wird genutzt um Rules zu filtern die heute bereits gecrawlt wurden.
+    """
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return today_start.isoformat()
+
+
+# =============================================================================
 # SITEMAP PARSER
 # =============================================================================
 
@@ -194,7 +213,7 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
 
     try:
         client = await get_http_client()
-        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.8)"})
+        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.9)"})
 
         if r.status_code != 200:
             return []
@@ -209,7 +228,7 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
             for sitemap_loc in sitemaps[:5]:
                 sub_url = sitemap_loc.text.strip()
                 try:
-                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.8)"})
+                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.9)"})
                     if sub_r.status_code == 200:
                         sub_root = ET.fromstring(sub_r.text)
                         sub_ns = ""
@@ -568,7 +587,7 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
         insert_data.append({
             "url":              url,
             "page_title":       url_data["page_title"],
-            "is_main_url":      url_data["is_main_url"],   # v2.8.0: jetzt korrekt gesetzt
+            "is_main_url":      url_data["is_main_url"],
             "discovered_depth": url_data["discovered_depth"],
             "rule_id":          url_data["rule_id"],
             "country_code":     url_data["country_code"],
@@ -640,6 +659,7 @@ class DiscoveryResponse(BaseModel):
     total_urls_found: int
     successful_rules: int
     failed_rules: int
+    skipped_rules: int
     results_per_rule: List[Dict]
 
 class DirectDiscoveryResponse(BaseModel):
@@ -652,13 +672,13 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.8.0",
+        "version": "2.9.0",
         "status": "running",
-        "changes_v2.8.0": [
-            "Scoring komplett entfernt — Embedding in WF6 übernimmt Relevanzbeurteilung",
-            "Alle gecrawlten URLs landen in discovered_urls, nur BLOCKED_PATH_PATTERNS filtert",
-            "Target URL garantiert gecrawlt: is_main_url=True, überspringt Domain-Block",
-            "is_main_url wird jetzt korrekt in Supabase gespeichert",
+        "changes_v2.9.0": [
+            "Same-Day Protection: Rules die heute bereits gecrawlt wurden werden übersprungen",
+            "Kein doppeltes Crawlen am selben Tag — erneutes Crawlen ab dem nächsten Tag möglich",
+            "Nie gecrawlte Rules (last_crawled_at IS NULL) werden immer verarbeitet",
+            "skipped_rules Feld in DiscoveryResponse hinzugefügt",
         ]
     }
 
@@ -667,7 +687,7 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.8.0",
+        "version": "2.9.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
     }
 
@@ -709,7 +729,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
 @app.post("/discover", response_model=DiscoveryResponse)
 async def run_discovery(request: DiscoveryRequest):
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.8.0 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
+    logger.info(f"🚀 DISCOVERY API v2.9.0 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
     logger.info("=" * 80)
 
     try:
@@ -730,14 +750,46 @@ async def run_discovery(request: DiscoveryRequest):
         if not all_rules:
             return DiscoveryResponse(
                 success=False, total_rules_processed=0, total_urls_found=0,
-                successful_rules=0, failed_rules=0, results_per_rule=[]
+                successful_rules=0, failed_rules=0, skipped_rules=0, results_per_rule=[]
             )
 
-        rules = [r for r in all_rules if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)]
-        skipped = len(all_rules) - len(rules)
+        # v2.9.0: Same-Day Protection
+        # Rules die heute bereits gecrawlt wurden überspringen.
+        # Nie gecrawlte Rules (last_crawled_at IS NULL) immer verarbeiten.
+        today_start = get_today_start_utc()
+        skipped_today = []
+        rules_to_process = []
 
-        if skipped > 0:
-            logger.info(f"⏭️ Skipped {skipped} GROUP B rules")
+        for rule in all_rules:
+            last_crawled = rule.get("last_crawled_at")
+            if last_crawled and last_crawled >= today_start:
+                skipped_today.append(rule)
+            else:
+                rules_to_process.append(rule)
+
+        if skipped_today:
+            logger.info(f"⏭️ Heute bereits gecrawlt, übersprungen: {len(skipped_today)} Rules")
+            for r in skipped_today[:5]:  # Nur erste 5 loggen
+                logger.info(f"   ↳ {r['rule_id']} ({r['country_name']}) — last_crawled_at: {r.get('last_crawled_at')}")
+            if len(skipped_today) > 5:
+                logger.info(f"   ↳ ... und {len(skipped_today) - 5} weitere")
+
+        # GROUP B herausfiltern
+        rules = [r for r in rules_to_process if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)]
+        skipped_group_b = len(rules_to_process) - len(rules)
+
+        if skipped_group_b > 0:
+            logger.info(f"⏭️ Skipped {skipped_group_b} GROUP B rules")
+
+        total_skipped = len(skipped_today) + skipped_group_b
+
+        if not rules:
+            logger.info("✅ Keine Rules zu verarbeiten — alle heute bereits gecrawlt oder GROUP B.")
+            return DiscoveryResponse(
+                success=True, total_rules_processed=0, total_urls_found=0,
+                successful_rules=0, failed_rules=0, skipped_rules=total_skipped,
+                results_per_rule=[]
+            )
 
         logger.info(f"📋 {len(rules)} Rules werden verarbeitet (max {MAX_PARALLEL_RULES} parallel, {CONCURRENT_LIMIT} URLs/Rule)")
 
@@ -784,6 +836,7 @@ async def run_discovery(request: DiscoveryRequest):
             total_urls_found=total_urls_found,
             successful_rules=sum(1 for r in results_per_rule if r['success']),
             failed_rules=sum(1 for r in results_per_rule if not r['success']),
+            skipped_rules=total_skipped,
             results_per_rule=list(results_per_rule)
         )
 
@@ -798,11 +851,12 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.8.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v2.9.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
     logger.info(f"⚡ Domain fail threshold (Sub-URLs): {DOMAIN_FAIL_THRESHOLD}")
+    logger.info(f"⚡ Same-Day Protection: aktiv — Rules werden pro Tag max. einmal gecrawlt")
     logger.info("✅ API is ready!")
 
 

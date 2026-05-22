@@ -1,6 +1,6 @@
 """
 URL Discovery API for Visa Scraper
-FastAPI Service deployed on Railway.app
+FastAPI Service deployed on Hetzner
 Calls Python discovery logic and returns results to n8n
 
 v2.0.0 - Optimized Crawling Engine
@@ -31,6 +31,11 @@ v2.9.0 - Same-Day Protection: Rules die heute bereits gecrawlt wurden (last_craw
          >= Tagesbeginn UTC) werden übersprungen. Kein doppeltes Crawlen am selben Tag.
          Erneutes Crawlen am nächsten Tag oder später ist weiterhin möglich.
          Nie gecrawlte Rules (last_crawled_at IS NULL) werden immer verarbeitet.
+v3.0.0 - Job-System: /discover startet Job im Hintergrund und gibt sofort job_id zurück.
+         Kein Timeout mehr in n8n möglich — Job läuft unabhängig von der HTTP-Verbindung.
+         Neuer Endpoint GET /discover/status/{job_id} gibt aktuellen Fortschritt zurück.
+         n8n pollt /discover/status/{job_id} bis status='completed'.
+         Job-Speicher im RAM (dict) — wird bei Server-Neustart geleert, jobs laufen weiter.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -49,6 +54,7 @@ from typing import Optional, List, Dict
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+import uuid
 
 from fetch_markdown import router as fetch_markdown_router
 from fetch_apis import router as fetch_apis_router
@@ -59,7 +65,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="2.9.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -82,6 +88,19 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================================================================
+# v3.0.0: JOB STORE — speichert laufende und abgeschlossene Jobs im RAM
+# =============================================================================
+
+# Format: { "job_id": { "status": "running"|"completed"|"failed",
+#                       "total_rules": 100, "processed_rules": 42,
+#                       "skipped_rules": 10, "total_urls_found": 1500,
+#                       "successful_rules": 40, "failed_rules": 2,
+#                       "started_at": "...", "finished_at": None,
+#                       "current_country": "Portugal",
+#                       "results_per_rule": [...] } }
+JOB_STORE: Dict[str, Dict] = {}
+
+# =============================================================================
 # GROUP B wird von fetch_apis gehandelt
 # =============================================================================
 
@@ -91,18 +110,10 @@ EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
 # CRAWLING CONFIG
 # =============================================================================
 
-# v2.7.0: Reduziert von 10 → 5, da mehrere Rules parallel laufen
-# Bei MAX_PARALLEL_RULES=3 → max ~15 gleichzeitige Requests gesamt
 CONCURRENT_LIMIT = 5
-
-# v2.7.0: Maximale Anzahl parallel laufender Rules (CX33: 4 vCPUs, 8GB RAM)
 MAX_PARALLEL_RULES = 3
-
 MAX_RETRIES = 2
 RETRY_DELAYS = [1, 3]
-
-# v2.7.1: Nach dieser Anzahl gescheiterter Sub-URLs wird die Domain übersprungen.
-# Gilt NICHT für target_urls — diese werden immer versucht (is_main_url=True).
 DOMAIN_FAIL_THRESHOLD = 3
 
 IGNORED_QUERY_PARAMS = [
@@ -136,14 +147,12 @@ BLOCKED_PATH_PATTERNS = [
 
 def normalize_url(url: str) -> str:
     parsed = urlparse(url)
-
     if parsed.query:
         params = parse_qs(parsed.query, keep_blank_values=True)
         filtered = {k: v for k, v in params.items() if k.lower() not in IGNORED_QUERY_PARAMS}
         clean_query = urlencode(filtered, doseq=True) if filtered else ""
     else:
         clean_query = ""
-
     path = parsed.path.rstrip("/") if parsed.path != "/" else "/"
     normalized = parsed._replace(fragment="", query=clean_query, path=path).geturl()
     return normalized
@@ -175,29 +184,18 @@ def extract_main_content(soup: BeautifulSoup) -> str:
         ".content, .main-content, .page-content, .entry-content, "
         ".article-body, .post-content"
     )
-
     if content:
         for tag in content.select("nav, footer, header, aside, .sidebar, .menu, .nav, .breadcrumb"):
             tag.decompose()
         text = content.get_text(" ", strip=True)
         if len(text) > 100:
             return text
-
     for tag in soup.select("nav, footer, header, aside, .sidebar, .menu, .nav, .breadcrumb, .cookie, script, style"):
         tag.decompose()
-
     return soup.get_text(" ", strip=True)
 
 
-# =============================================================================
-# v2.9.0: SAME-DAY PROTECTION HELPER
-# =============================================================================
-
 def get_today_start_utc() -> str:
-    """
-    Gibt den Tagesbeginn (00:00:00 UTC) als ISO-String zurück.
-    Wird genutzt um Rules zu filtern die heute bereits gecrawlt wurden.
-    """
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return today_start.isoformat()
@@ -210,25 +208,21 @@ def get_today_start_utc() -> str:
 async def fetch_sitemap_urls(base_url: str) -> List[str]:
     sitemap_url = urljoin(base_url, "/sitemap.xml")
     urls = []
-
     try:
         client = await get_http_client()
-        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.9)"})
-
+        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.0)"})
         if r.status_code != 200:
             return []
-
         root = ET.fromstring(r.text)
         ns = ""
         if root.tag.startswith("{"):
             ns = root.tag.split("}")[0] + "}"
-
         sitemaps = root.findall(f".//{ns}sitemap/{ns}loc")
         if sitemaps:
             for sitemap_loc in sitemaps[:5]:
                 sub_url = sitemap_loc.text.strip()
                 try:
-                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/2.9)"})
+                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.0)"})
                     if sub_r.status_code == 200:
                         sub_root = ET.fromstring(sub_r.text)
                         sub_ns = ""
@@ -243,12 +237,9 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
             for loc in root.findall(f".//{ns}loc"):
                 if loc.text:
                     urls.append(loc.text.strip())
-
         logger.info(f"📋 Sitemap: {len(urls)} URLs gefunden")
-
     except Exception as e:
         logger.info(f"📋 Sitemap nicht verfügbar: {str(e)}")
-
     return urls
 
 
@@ -281,22 +272,11 @@ async def get_http_client() -> httpx.AsyncClient:
 
 
 async def fetch_html_fast(url: str, domain_fails: Dict[str, int], is_target: bool = False) -> Optional[str]:
-    """
-    Fetcht HTML einer URL mit Retry-Logik und Domain Block Detection.
-
-    v2.8.0: is_target=True überspringt den Domain-Block-Check vollständig.
-    Target URLs aus config_rules werden immer versucht, egal wie oft
-    andere URLs der gleichen Domain vorher gescheitert sind.
-    """
     domain = get_domain(url)
-
-    # Domain-Block gilt nicht für manuell konfigurierte target_urls
     if not is_target and domain_fails.get(domain, 0) >= DOMAIN_FAIL_THRESHOLD:
         logger.info(f"⛔ Domain geblockt, skip: {domain} ({url})")
         return None
-
     client = await get_http_client()
-
     for attempt in range(MAX_RETRIES):
         try:
             r = await client.get(url)
@@ -313,14 +293,11 @@ async def fetch_html_fast(url: str, domain_fails: Dict[str, int], is_target: boo
                 return None
             elif r.status_code in (503, 502):
                 if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_DELAYS[attempt]
-                    logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} (Status {r.status_code})")
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
                     continue
                 else:
                     if not is_target:
                         domain_fails[domain] = domain_fails.get(domain, 0) + 1
-                        logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
                         if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
                             logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
                     return None
@@ -329,21 +306,17 @@ async def fetch_html_fast(url: str, domain_fails: Dict[str, int], is_target: boo
                 return None
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             if attempt < MAX_RETRIES - 1:
-                delay = RETRY_DELAYS[attempt]
-                logger.info(f"🔄 Retry {attempt + 1}/{MAX_RETRIES} für {url} ({type(e).__name__})")
-                await asyncio.sleep(delay)
+                await asyncio.sleep(RETRY_DELAYS[attempt])
                 continue
             else:
                 if not is_target:
                     domain_fails[domain] = domain_fails.get(domain, 0) + 1
-                    logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} ({type(e).__name__})")
                     if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
                         logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
                 return None
         except Exception as e:
             logger.warning(f"⚠️ httpx Fehler für {url}: {str(e)}")
             return None
-
     return None
 
 
@@ -362,31 +335,24 @@ async def fetch_html_playwright(url: str, browser) -> Optional[str]:
 def needs_javascript(html: str) -> bool:
     soup = BeautifulSoup(html, "html.parser")
     text = extract_main_content(soup)
-
     script_count = len(soup.find_all("script"))
     if len(text) < 200 and script_count > 5:
         return True
-
     html_lower = html.lower()
     spa_indicators = ["__next", "__nuxt", "react-root", "ng-app", "v-app", 'id="app"']
     if len(text) < 200 and any(ind in html_lower for ind in spa_indicators):
         return True
-
     return False
 
 
 # =============================================================================
 # MAIN DISCOVERY FUNCTION
-# v2.8.0: Kein Scoring mehr. Alle gecrawlten URLs landen in discovered_urls.
-#         Einziger Filter: BLOCKED_PATH_PATTERNS + is_internal.
-#         Target URL wird immer gecrawlt (is_main_url=True, kein Domain-Block).
 # =============================================================================
 
 async def discover_urls(rule: Dict) -> List[Dict]:
     start_url    = rule['target_url']
     max_pages    = rule['max_urls']
     max_depth    = rule['max_depth']
-    country_iso  = rule['country_iso']
     target_group = rule['target_group']
 
     ext = tldextract.extract(start_url)
@@ -397,15 +363,12 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
     playwright_instance = None
     playwright_browser = None
-
     domain_fails: Dict[str, int] = {}
-
     normalized_start = normalize_url(start_url)
 
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
     logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
 
-    # Sitemap als zusätzliche Seed-Quelle
     sitemap_urls = await fetch_sitemap_urls(start_url)
     if sitemap_urls:
         sitemap_filtered = [u for u in sitemap_urls if is_internal(u, base_domain) and not is_blocked_path(u)]
@@ -416,26 +379,21 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     to_visit = deque()
     to_visit_set = set()
 
-    # Sitemap-URLs in Queue
     for sm_url in sitemap_filtered[:max_pages]:
         normalized_sm = normalize_url(sm_url)
         if normalized_sm not in to_visit_set:
             to_visit.append((normalized_sm, 0, False))
             to_visit_set.add(normalized_sm)
 
-    # Target URL immer als erstes und mit is_target=True
     if normalized_start not in to_visit_set:
         to_visit.appendleft((normalized_start, 0, True))
         to_visit_set.add(normalized_start)
 
     async def process_page(url: str, depth: int, is_target: bool) -> tuple:
         nonlocal playwright_instance, playwright_browser
-
         async with semaphore:
             url_lower = url.lower()
             is_pdf = url_lower.endswith(".pdf") or ".pdf?" in url_lower
-
-            # PDFs direkt als URL speichern — kein HTML-Fetch nötig
             if is_pdf:
                 return url, depth, is_target, {
                     "url": url,
@@ -449,7 +407,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 }, []
 
             html = await fetch_html_fast(url, domain_fails, is_target=is_target)
-
             needs_pw = html and needs_javascript(html)
 
             if html and not needs_pw:
@@ -471,8 +428,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     )
                 html = await fetch_html_playwright(url, playwright_browser)
 
-            # Kein HTML → target_urls trotzdem als URL-Eintrag speichern
-            # damit WF1b sie später per fetch_markdown nochmal versuchen kann
             if not html:
                 if is_target:
                     logger.warning(f"⚠️ Target URL konnte nicht geladen werden, trotzdem gespeichert: {url}")
@@ -489,11 +444,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 return url, depth, is_target, None, []
 
             soup = BeautifulSoup(html, "html.parser")
-
             title_tag = soup.find("title")
             page_title = title_tag.get_text(strip=True) if title_tag else ""
 
-            # Child-Links extrahieren für weitere Crawling-Tiefe
             child_links = []
             if depth < max_depth:
                 for a_tag in soup.select("a[href]"):
@@ -507,7 +460,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
                         child_links.append(normalized_full)
 
-            # v2.8.0: Kein Score-Filter mehr — alle gecrawlten URLs werden gespeichert
             result = {
                 "url": url,
                 "page_title": page_title[:500],
@@ -518,7 +470,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 "country_name": rule['country_name'],
                 "target_group": rule['target_group']
             }
-
             return url, depth, is_target, result, child_links
 
     while to_visit and len(visited) < max_pages:
@@ -536,7 +487,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             break
 
         logger.info(f"🔎 [{rule['rule_id']}] Batch: {len(batch)} Seiten (gesamt: {len(visited)}/{max_pages})")
-
         tasks = [process_page(url, depth, is_target) for url, depth, is_target in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -544,12 +494,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             if isinstance(result, Exception):
                 logger.error(f"⚠️ Batch-Fehler: {str(result)}")
                 continue
-
             url, depth, is_target, url_data, child_links = result
-
             if url_data:
                 discovered_urls.append(url_data)
-
             for link in child_links:
                 if link not in visited and link not in to_visit_set and len(visited) + len(to_visit) < max_pages * 2:
                     to_visit.append((link, depth + 1, False))
@@ -573,7 +520,6 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
         return 0
 
     logger.info(f"💾 Preparing to save {len(discovered_urls)} URLs to Supabase...")
-
     seen_urls = set()
     insert_data = []
     duplicates_removed = 0
@@ -599,16 +545,13 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     if duplicates_removed > 0:
         logger.info(f"🧹 Removed {duplicates_removed} duplicate URLs from batch")
 
-    # v2.6.0: Chunked URLs nicht überschreiben
     try:
         all_urls = [d["url"] for d in insert_data]
         existing = supabase.table("discovered_urls").select("url, status").in_("url", all_urls).execute()
         chunked_urls = {row["url"] for row in existing.data if row["status"] == "chunked"}
-
         if chunked_urls:
-            logger.info(f"🔒 Skipping {len(chunked_urls)} already chunked URLs — nicht überschreiben")
+            logger.info(f"🔒 Skipping {len(chunked_urls)} already chunked URLs")
             insert_data = [d for d in insert_data if d["url"] not in chunked_urls]
-
     except Exception as e:
         logger.warning(f"⚠️ Could not check existing statuses: {str(e)}")
 
@@ -635,6 +578,80 @@ def update_last_crawled(rule_id: str):
 
 
 # =============================================================================
+# v3.0.0: HINTERGRUND-JOB FUNKTION
+# Wird von asyncio.create_task() gestartet — läuft unabhängig von n8n-Verbindung
+# =============================================================================
+
+async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: Optional[int]):
+    """
+    Verarbeitet alle Rules im Hintergrund.
+    Aktualisiert JOB_STORE laufend damit /discover/status/{job_id} immer
+    den aktuellen Stand zurückgeben kann.
+    """
+    job = JOB_STORE[job_id]
+    job["status"] = "running"
+    job["total_rules"] = len(rules)
+
+    rule_semaphore = asyncio.Semaphore(MAX_PARALLEL_RULES)
+
+    async def process_rule(rule: Dict, index: int) -> Dict:
+        async with rule_semaphore:
+            # Aktuelles Land im Job-Status anzeigen
+            job["current_country"] = f"{rule['country_name']} ({rule['rule_id']})"
+            logger.info(f"▶️  [{job_id}] Rule {index}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
+
+            try:
+                if max_urls_override:
+                    rule['max_urls'] = max_urls_override
+
+                discovered = await discover_urls(rule)
+                saved_count = save_urls_to_supabase(discovered)
+                update_last_crawled(rule['rule_id'])
+
+                job["processed_rules"] += 1
+                job["successful_rules"] += 1
+                job["total_urls_found"] += saved_count
+
+                logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} URLs — {job['processed_rules']}/{job['total_rules']} Rules done")
+
+                return {
+                    "rule_id":      rule['rule_id'],
+                    "country":      rule['country_name'],
+                    "target_group": rule['target_group'],
+                    "urls_found":   saved_count,
+                    "success":      True
+                }
+
+            except Exception as e:
+                job["processed_rules"] += 1
+                job["failed_rules"] += 1
+                logger.error(f"❌ [{job_id}] Fehler bei Rule {rule['rule_id']}: {str(e)}")
+                return {
+                    "rule_id":      rule['rule_id'],
+                    "country":      rule['country_name'],
+                    "target_group": rule.get('target_group', 'unknown'),
+                    "urls_found":   0,
+                    "success":      False,
+                    "error":        str(e)
+                }
+
+    try:
+        tasks = [process_rule(rule, i) for i, rule in enumerate(rules, 1)]
+        results = await asyncio.gather(*tasks)
+        job["results_per_rule"] = list(results)
+        job["status"] = "completed"
+        job["current_country"] = None
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        logger.info(f"🎉 [{job_id}] Job completed: {job['total_urls_found']} URLs, {job['successful_rules']} rules OK, {job['failed_rules']} failed")
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = str(e)
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        logger.error(f"❌ [{job_id}] Job failed: {str(e)}")
+
+
+# =============================================================================
 # API ENDPOINTS
 # =============================================================================
 
@@ -653,14 +670,26 @@ class DirectDiscoveryRequest(BaseModel):
     max_depth: int = 3
     max_urls: int = 100
 
-class DiscoveryResponse(BaseModel):
-    success: bool
-    total_rules_processed: int
-    total_urls_found: int
+class DiscoveryJobResponse(BaseModel):
+    job_id: str
+    status: str
+    total_rules: int
+    skipped_rules: int
+    message: str
+
+class DiscoveryStatusResponse(BaseModel):
+    job_id: str
+    status: str                  # "running" | "completed" | "failed"
+    total_rules: int
+    processed_rules: int
+    skipped_rules: int
     successful_rules: int
     failed_rules: int
-    skipped_rules: int
-    results_per_rule: List[Dict]
+    total_urls_found: int
+    current_country: Optional[str]
+    started_at: str
+    finished_at: Optional[str]
+    progress_pct: float          # 0.0 – 100.0
 
 class DirectDiscoveryResponse(BaseModel):
     success: bool
@@ -672,24 +701,158 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "2.9.0",
+        "version": "3.0.0",
         "status": "running",
-        "changes_v2.9.0": [
-            "Same-Day Protection: Rules die heute bereits gecrawlt wurden werden übersprungen",
-            "Kein doppeltes Crawlen am selben Tag — erneutes Crawlen ab dem nächsten Tag möglich",
-            "Nie gecrawlte Rules (last_crawled_at IS NULL) werden immer verarbeitet",
-            "skipped_rules Feld in DiscoveryResponse hinzugefügt",
+        "changes_v3.0.0": [
+            "Job-System: /discover gibt sofort job_id zurück, Job läuft im Hintergrund",
+            "Kein Timeout mehr — n8n Verbindung wird sofort geschlossen",
+            "GET /discover/status/{job_id} zeigt Echtzeit-Fortschritt",
+            "n8n pollt /discover/status/{job_id} bis status='completed'",
         ]
     }
 
 
 @app.get("/health")
 async def health():
+    running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "2.9.0",
-        "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY)
+        "version": "3.0.0",
+        "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
+        "active_jobs": running_jobs,
     }
+
+
+@app.post("/discover", response_model=DiscoveryJobResponse)
+async def run_discovery(request: DiscoveryRequest):
+    """
+    v3.0.0: Startet Discovery-Job im Hintergrund und gibt sofort job_id zurück.
+    n8n wartet NICHT mehr auf die Fertigstellung — kein Timeout möglich.
+    Fortschritt via GET /discover/status/{job_id} abrufbar.
+    """
+    logger.info("=" * 80)
+    logger.info(f"🚀 DISCOVERY API v3.0.0 — JOB MODE")
+    logger.info("=" * 80)
+
+    try:
+        query = supabase.table("config_rules").select("*").eq("active", True)
+
+        if request.rule_ids:
+            query = query.in_("rule_id", request.rule_ids)
+        if request.filter:
+            if "country_iso" in request.filter:
+                query = query.eq("country_iso", request.filter["country_iso"])
+            if "target_group" in request.filter:
+                query = query.eq("target_group", request.filter["target_group"])
+
+        response = query.execute()
+        all_rules = response.data
+
+        if not all_rules:
+            job_id = str(uuid.uuid4())
+            JOB_STORE[job_id] = {"status": "completed", "total_rules": 0, "processed_rules": 0,
+                                  "skipped_rules": 0, "successful_rules": 0, "failed_rules": 0,
+                                  "total_urls_found": 0, "current_country": None,
+                                  "started_at": datetime.now(timezone.utc).isoformat(),
+                                  "finished_at": datetime.now(timezone.utc).isoformat(),
+                                  "results_per_rule": []}
+            return DiscoveryJobResponse(job_id=job_id, status="completed", total_rules=0,
+                                        skipped_rules=0, message="Keine aktiven Rules gefunden")
+
+        # Same-Day Protection
+        today_start = get_today_start_utc()
+        skipped_today = []
+        rules_to_process = []
+
+        for rule in all_rules:
+            last_crawled = rule.get("last_crawled_at")
+            if last_crawled and last_crawled >= today_start:
+                skipped_today.append(rule)
+            else:
+                rules_to_process.append(rule)
+
+        if skipped_today:
+            logger.info(f"⏭️ Heute bereits gecrawlt, übersprungen: {len(skipped_today)} Rules")
+
+        # GROUP B herausfiltern
+        rules = [r for r in rules_to_process if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)]
+        skipped_group_b = len(rules_to_process) - len(rules)
+        total_skipped = len(skipped_today) + skipped_group_b
+
+        if not rules:
+            job_id = str(uuid.uuid4())
+            JOB_STORE[job_id] = {"status": "completed", "total_rules": 0, "processed_rules": 0,
+                                  "skipped_rules": total_skipped, "successful_rules": 0, "failed_rules": 0,
+                                  "total_urls_found": 0, "current_country": None,
+                                  "started_at": datetime.now(timezone.utc).isoformat(),
+                                  "finished_at": datetime.now(timezone.utc).isoformat(),
+                                  "results_per_rule": []}
+            return DiscoveryJobResponse(job_id=job_id, status="completed", total_rules=0,
+                                        skipped_rules=total_skipped,
+                                        message="Alle Rules heute bereits gecrawlt oder GROUP B")
+
+        # Job anlegen
+        job_id = str(uuid.uuid4())
+        JOB_STORE[job_id] = {
+            "status":           "queued",
+            "total_rules":      len(rules),
+            "processed_rules":  0,
+            "skipped_rules":    total_skipped,
+            "successful_rules": 0,
+            "failed_rules":     0,
+            "total_urls_found": 0,
+            "current_country":  None,
+            "started_at":       datetime.now(timezone.utc).isoformat(),
+            "finished_at":      None,
+            "results_per_rule": [],
+        }
+
+        # Job im Hintergrund starten — gibt sofort zurück
+        asyncio.create_task(run_discovery_job(job_id, rules, request.max_urls))
+
+        logger.info(f"✅ Job {job_id} gestartet: {len(rules)} Rules, {total_skipped} übersprungen")
+
+        return DiscoveryJobResponse(
+            job_id=job_id,
+            status="running",
+            total_rules=len(rules),
+            skipped_rules=total_skipped,
+            message=f"Job gestartet — {len(rules)} Rules werden verarbeitet, {total_skipped} übersprungen"
+        )
+
+    except Exception as e:
+        logger.error(f"❌ Critical error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/discover/status/{job_id}", response_model=DiscoveryStatusResponse)
+async def get_discovery_status(job_id: str):
+    """
+    v3.0.0: Gibt aktuellen Stand eines laufenden oder abgeschlossenen Jobs zurück.
+    n8n pollt diesen Endpoint bis status='completed'.
+    """
+    if job_id not in JOB_STORE:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} nicht gefunden")
+
+    job = JOB_STORE[job_id]
+    total = job["total_rules"]
+    processed = job["processed_rules"]
+    progress = round((processed / total * 100), 1) if total > 0 else 100.0
+
+    return DiscoveryStatusResponse(
+        job_id=job_id,
+        status=job["status"],
+        total_rules=total,
+        processed_rules=processed,
+        skipped_rules=job["skipped_rules"],
+        successful_rules=job["successful_rules"],
+        failed_rules=job["failed_rules"],
+        total_urls_found=job["total_urls_found"],
+        current_country=job.get("current_country"),
+        started_at=job["started_at"],
+        finished_at=job.get("finished_at"),
+        progress_pct=progress,
+    )
 
 
 @app.post("/discover-direct", response_model=DirectDiscoveryResponse)
@@ -702,7 +865,6 @@ async def discover_direct(request: DirectDiscoveryRequest):
     logger.info("=" * 80)
 
     discovered_urls = []
-
     try:
         for i, start_url in enumerate(request.start_urls, 1):
             rule = {
@@ -726,137 +888,19 @@ async def discover_direct(request: DirectDiscoveryRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/discover", response_model=DiscoveryResponse)
-async def run_discovery(request: DiscoveryRequest):
-    logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v2.9.0 — PARALLEL MODE (max {MAX_PARALLEL_RULES} Rules gleichzeitig)")
-    logger.info("=" * 80)
-
-    try:
-        query = supabase.table("config_rules").select("*").eq("active", True)
-
-        if request.rule_ids:
-            query = query.in_("rule_id", request.rule_ids)
-
-        if request.filter:
-            if "country_iso" in request.filter:
-                query = query.eq("country_iso", request.filter["country_iso"])
-            if "target_group" in request.filter:
-                query = query.eq("target_group", request.filter["target_group"])
-
-        response = query.execute()
-        all_rules = response.data
-
-        if not all_rules:
-            return DiscoveryResponse(
-                success=False, total_rules_processed=0, total_urls_found=0,
-                successful_rules=0, failed_rules=0, skipped_rules=0, results_per_rule=[]
-            )
-
-        # v2.9.0: Same-Day Protection
-        # Rules die heute bereits gecrawlt wurden überspringen.
-        # Nie gecrawlte Rules (last_crawled_at IS NULL) immer verarbeiten.
-        today_start = get_today_start_utc()
-        skipped_today = []
-        rules_to_process = []
-
-        for rule in all_rules:
-            last_crawled = rule.get("last_crawled_at")
-            if last_crawled and last_crawled >= today_start:
-                skipped_today.append(rule)
-            else:
-                rules_to_process.append(rule)
-
-        if skipped_today:
-            logger.info(f"⏭️ Heute bereits gecrawlt, übersprungen: {len(skipped_today)} Rules")
-            for r in skipped_today[:5]:  # Nur erste 5 loggen
-                logger.info(f"   ↳ {r['rule_id']} ({r['country_name']}) — last_crawled_at: {r.get('last_crawled_at')}")
-            if len(skipped_today) > 5:
-                logger.info(f"   ↳ ... und {len(skipped_today) - 5} weitere")
-
-        # GROUP B herausfiltern
-        rules = [r for r in rules_to_process if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)]
-        skipped_group_b = len(rules_to_process) - len(rules)
-
-        if skipped_group_b > 0:
-            logger.info(f"⏭️ Skipped {skipped_group_b} GROUP B rules")
-
-        total_skipped = len(skipped_today) + skipped_group_b
-
-        if not rules:
-            logger.info("✅ Keine Rules zu verarbeiten — alle heute bereits gecrawlt oder GROUP B.")
-            return DiscoveryResponse(
-                success=True, total_rules_processed=0, total_urls_found=0,
-                successful_rules=0, failed_rules=0, skipped_rules=total_skipped,
-                results_per_rule=[]
-            )
-
-        logger.info(f"📋 {len(rules)} Rules werden verarbeitet (max {MAX_PARALLEL_RULES} parallel, {CONCURRENT_LIMIT} URLs/Rule)")
-
-        rule_semaphore = asyncio.Semaphore(MAX_PARALLEL_RULES)
-
-        async def process_rule(rule: Dict, index: int) -> Dict:
-            async with rule_semaphore:
-                logger.info(f"▶️  Rule {index}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
-                try:
-                    if request.max_urls:
-                        rule['max_urls'] = request.max_urls
-
-                    discovered_urls = await discover_urls(rule)
-                    saved_count = save_urls_to_supabase(discovered_urls)
-                    update_last_crawled(rule['rule_id'])
-
-                    logger.info(f"✅ Rule {rule['rule_id']} fertig: {saved_count} URLs gespeichert")
-                    return {
-                        "rule_id":      rule['rule_id'],
-                        "country":      rule['country_name'],
-                        "target_group": rule['target_group'],
-                        "urls_found":   saved_count,
-                        "success":      True
-                    }
-
-                except Exception as e:
-                    logger.error(f"❌ Fehler bei Rule {rule['rule_id']}: {str(e)}")
-                    return {
-                        "rule_id":      rule['rule_id'],
-                        "country":      rule['country_name'],
-                        "target_group": rule.get('target_group', 'unknown'),
-                        "urls_found":   0,
-                        "success":      False,
-                        "error":        str(e)
-                    }
-
-        tasks = [process_rule(rule, i) for i, rule in enumerate(rules, 1)]
-        results_per_rule = await asyncio.gather(*tasks)
-        total_urls_found = sum(r['urls_found'] for r in results_per_rule)
-
-        return DiscoveryResponse(
-            success=True,
-            total_rules_processed=len(rules),
-            total_urls_found=total_urls_found,
-            successful_rules=sum(1 for r in results_per_rule if r['success']),
-            failed_rules=sum(1 for r in results_per_rule if not r['success']),
-            skipped_rules=total_skipped,
-            results_per_rule=list(results_per_rule)
-        )
-
-    except Exception as e:
-        logger.error(f"❌ Critical error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # =============================================================================
 # STARTUP / SHUTDOWN
 # =============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v2.9.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.0.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
     logger.info(f"⚡ Domain fail threshold (Sub-URLs): {DOMAIN_FAIL_THRESHOLD}")
-    logger.info(f"⚡ Same-Day Protection: aktiv — Rules werden pro Tag max. einmal gecrawlt")
+    logger.info(f"⚡ Same-Day Protection: aktiv")
+    logger.info(f"⚡ Job-System: aktiv — /discover gibt sofort job_id zurück")
     logger.info("✅ API is ready!")
 
 

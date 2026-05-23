@@ -36,6 +36,10 @@ v3.0.0 - Job-System: /discover startet Job im Hintergrund und gibt sofort job_id
          Neuer Endpoint GET /discover/status/{job_id} gibt aktuellen Fortschritt zurück.
          n8n pollt /discover/status/{job_id} bis status='completed'.
          Job-Speicher im RAM (dict) — wird bei Server-Neustart geleert, jobs laufen weiter.
+v3.1.0 - NULL-first Sortierung: Rules werden aus Supabase sortiert abgerufen.
+         Erst alle nie gecrawlten Rules (last_crawled_at IS NULL), dann nach Timestamp
+         aufsteigend (älteste zuerst). Dadurch vorhersehbare, in Supabase nachvollziehbare
+         Reihenfolge — neue Rules werden garantiert als erstes abgearbeitet.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -65,7 +69,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.0.0"
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -701,13 +705,13 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "status": "running",
-        "changes_v3.0.0": [
-            "Job-System: /discover gibt sofort job_id zurück, Job läuft im Hintergrund",
-            "Kein Timeout mehr — n8n Verbindung wird sofort geschlossen",
-            "GET /discover/status/{job_id} zeigt Echtzeit-Fortschritt",
-            "n8n pollt /discover/status/{job_id} bis status='completed'",
+        "changes_v3.1.0": [
+            "NULL-first Sortierung: nie gecrawlte Rules (last_crawled_at IS NULL) zuerst",
+            "Danach aufsteigend nach Timestamp — älteste Rules als nächstes",
+            "Vorhersehbare Reihenfolge die in Supabase direkt nachvollziehbar ist",
+            "Neue Rules werden garantiert beim nächsten Run als erstes abgearbeitet",
         ]
     }
 
@@ -717,7 +721,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -726,16 +730,22 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     """
-    v3.0.0: Startet Discovery-Job im Hintergrund und gibt sofort job_id zurück.
-    n8n wartet NICHT mehr auf die Fertigstellung — kein Timeout möglich.
-    Fortschritt via GET /discover/status/{job_id} abrufbar.
+    v3.1.0: Rules werden sortiert abgerufen — NULL zuerst, dann älteste Timestamps.
+    Dadurch vorhersehbare Reihenfolge die in Supabase direkt nachvollziehbar ist.
     """
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.0.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.1.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
-        query = supabase.table("config_rules").select("*").eq("active", True)
+        # v3.1.0: ORDER BY last_crawled_at ASC NULLS FIRST
+        # → Nie gecrawlte Rules (NULL) kommen zuerst, dann älteste Timestamps
+        query = (
+            supabase.table("config_rules")
+            .select("*")
+            .eq("active", True)
+            .order("last_crawled_at", ascending=True, nulls_first=True)
+        )
 
         if request.rule_ids:
             query = query.in_("rule_id", request.rule_ids)
@@ -894,13 +904,14 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.0.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.1.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
     logger.info(f"⚡ Domain fail threshold (Sub-URLs): {DOMAIN_FAIL_THRESHOLD}")
     logger.info(f"⚡ Same-Day Protection: aktiv")
     logger.info(f"⚡ Job-System: aktiv — /discover gibt sofort job_id zurück")
+    logger.info(f"⚡ NULL-first Sortierung: aktiv — nie gecrawlte Rules zuerst")
     logger.info("✅ API is ready!")
 
 

@@ -115,7 +115,7 @@ EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
 # =============================================================================
 
 CONCURRENT_LIMIT = 5
-MAX_PARALLEL_RULES = 3
+MAX_PARALLEL_RULES = 2
 MAX_RETRIES = 2
 RETRY_DELAYS = [1, 3]
 DOMAIN_FAIL_THRESHOLD = 3

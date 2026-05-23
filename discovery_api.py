@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.1.0"
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -705,9 +705,9 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "status": "running",
-        "changes_v3.1.0": [
+        "changes_v3.2.0": [
             "NULL-first Sortierung: nie gecrawlte Rules (last_crawled_at IS NULL) zuerst",
             "Danach aufsteigend nach Timestamp — älteste Rules als nächstes",
             "Vorhersehbare Reihenfolge die in Supabase direkt nachvollziehbar ist",
@@ -721,7 +721,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -730,21 +730,20 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     """
-    v3.1.0: Rules werden sortiert abgerufen — NULL zuerst, dann älteste Timestamps.
+    v3.2.0: Rules werden sortiert abgerufen — NULL zuerst, dann älteste Timestamps.
     Dadurch vorhersehbare Reihenfolge die in Supabase direkt nachvollziehbar ist.
     """
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.1.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.2.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
-        # v3.1.0: ORDER BY last_crawled_at ASC NULLS FIRST
+        # v3.2.0: ORDER BY last_crawled_at ASC NULLS FIRST
         # → Nie gecrawlte Rules (NULL) kommen zuerst, dann älteste Timestamps
         query = (
             supabase.table("config_rules")
             .select("*")
             .eq("active", True)
-            .order("last_crawled_at", ascending=True, nulls_first=True)
         )
 
         if request.rule_ids:
@@ -756,7 +755,12 @@ async def run_discovery(request: DiscoveryRequest):
                 query = query.eq("target_group", request.filter["target_group"])
 
         response = query.execute()
-        all_rules = response.data
+        # v3.2.0: NULL-first Sortierung in Python — kompatibel mit allen supabase-py Versionen
+        # NULL zuerst, dann älteste Timestamps aufsteigend
+        all_rules = sorted(
+            response.data,
+            key=lambda r: (r.get("last_crawled_at") is not None, r.get("last_crawled_at") or "")
+        )
 
         if not all_rules:
             job_id = str(uuid.uuid4())
@@ -904,7 +908,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.1.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.2.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")

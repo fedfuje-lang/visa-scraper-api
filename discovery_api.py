@@ -40,6 +40,11 @@ v3.1.0 - NULL-first Sortierung: Rules werden aus Supabase sortiert abgerufen.
          Erst alle nie gecrawlten Rules (last_crawled_at IS NULL), dann nach Timestamp
          aufsteigend (älteste zuerst). Dadurch vorhersehbare, in Supabase nachvollziehbare
          Reihenfolge — neue Rules werden garantiert als erstes abgearbeitet.
+v3.3.0 - Pagination Fix: Supabase liefert standardmäßig max. 1000 Rows. Bei 1276 aktiven
+         Rules wurden die 214 NULL-Rules (Position 1001-1276) nie geliefert. Neue Funktion
+         fetch_all_rules() holt alle Rules via .range()-Pagination in 1000er-Batches.
+         Sortierung jetzt direkt in DB via .order('last_crawled_at', nullsfirst=True) —
+         kein Python-Sort mehr nötig. NULL-Rules kommen garantiert in jedem Run an.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -69,7 +74,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.2.0"
+    version="3.3.0"  # v3.3.0: Pagination Fix
 )
 
 app.add_middleware(
@@ -203,6 +208,44 @@ def get_today_start_utc() -> str:
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return today_start.isoformat()
+
+
+# =============================================================================
+# v3.3.0: PAGINATION FIX — holt ALLE Rules aus Supabase (nicht nur die ersten 1000)
+# Supabase liefert standardmäßig max. 1000 Rows. Bei 1276 aktiven Rules wurden
+# die 214 NULL-Rules (Position 1001-1276 bei NULLS LAST) nie geliefert.
+# Lösung: .range()-Pagination in 1000er-Batches + Sortierung direkt in DB.
+# =============================================================================
+
+def fetch_all_rules(base_query) -> List[Dict]:
+    """
+    Holt alle aktiven Rules via Pagination — umgeht das 1000-Row-Limit von Supabase.
+    Sortierung: NULL zuerst (nie gecrawlte Rules), dann älteste Timestamps aufsteigend.
+    base_query: bereits gebaute Query (mit .eq('active', True) und optionalen Filtern),
+                OHNE .execute() — diese Funktion fügt .order() und .range() hinzu.
+    """
+    all_rules = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        response = (
+            base_query
+            .order("last_crawled_at", desc=False, nullsfirst=True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        batch = response.data
+        if not batch:
+            break
+        all_rules.extend(batch)
+        logger.info(f"📦 Pagination: {len(batch)} Rules geladen (offset {offset}, gesamt bisher: {len(all_rules)})")
+        if len(batch) < page_size:
+            break  # Letzte Seite erreicht
+        offset += page_size
+
+    logger.info(f"✅ fetch_all_rules: {len(all_rules)} Rules total geladen")
+    return all_rules
 
 
 # =============================================================================
@@ -705,13 +748,13 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "status": "running",
-        "changes_v3.2.0": [
-            "NULL-first Sortierung: nie gecrawlte Rules (last_crawled_at IS NULL) zuerst",
-            "Danach aufsteigend nach Timestamp — älteste Rules als nächstes",
-            "Vorhersehbare Reihenfolge die in Supabase direkt nachvollziehbar ist",
-            "Neue Rules werden garantiert beim nächsten Run als erstes abgearbeitet",
+        "changes_v3.3.0": [
+            "Pagination Fix: fetch_all_rules() holt alle Rules via .range()-Batches",
+            "Supabase 1000-Row-Limit wird umgangen — alle 1276 Rules kommen an",
+            "Sortierung jetzt direkt in DB via .order(nullsfirst=True) statt Python-Sort",
+            "214 NULL-Rules (Costa Rica, Japan, UK etc.) werden jetzt verarbeitet",
         ]
     }
 
@@ -721,7 +764,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -730,16 +773,17 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     """
-    v3.2.0: Rules werden sortiert abgerufen — NULL zuerst, dann älteste Timestamps.
-    Dadurch vorhersehbare Reihenfolge die in Supabase direkt nachvollziehbar ist.
+    v3.3.0: fetch_all_rules() umgeht das Supabase 1000-Row-Limit via Pagination.
+    Alle 1276 aktiven Rules werden geladen — inkl. der 214 NULL-Rules.
+    Sortierung direkt in DB: NULL zuerst, dann älteste Timestamps aufsteigend.
     """
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.2.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.3.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
-        # v3.2.0: ORDER BY last_crawled_at ASC NULLS FIRST
-        # → Nie gecrawlte Rules (NULL) kommen zuerst, dann älteste Timestamps
+        # v3.3.0: Query bauen OHNE .execute() — fetch_all_rules() übernimmt das
+        # .order() und .range() werden in fetch_all_rules() hinzugefügt
         query = (
             supabase.table("config_rules")
             .select("*")
@@ -754,13 +798,9 @@ async def run_discovery(request: DiscoveryRequest):
             if "target_group" in request.filter:
                 query = query.eq("target_group", request.filter["target_group"])
 
-        response = query.execute()
-        # v3.2.0: NULL-first Sortierung in Python — kompatibel mit allen supabase-py Versionen
-        # NULL zuerst, dann älteste Timestamps aufsteigend
-        all_rules = sorted(
-            response.data,
-            key=lambda r: (r.get("last_crawled_at") is not None, r.get("last_crawled_at") or "")
-        )
+        # v3.3.0: fetch_all_rules() statt .execute() — holt alle Rules via Pagination
+        # NULL zuerst (nie gecrawlt), dann älteste Timestamps — direkt in DB sortiert
+        all_rules = fetch_all_rules(query)
 
         if not all_rules:
             job_id = str(uuid.uuid4())
@@ -908,14 +948,14 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.2.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.3.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
     logger.info(f"⚡ Domain fail threshold (Sub-URLs): {DOMAIN_FAIL_THRESHOLD}")
     logger.info(f"⚡ Same-Day Protection: aktiv")
     logger.info(f"⚡ Job-System: aktiv — /discover gibt sofort job_id zurück")
-    logger.info(f"⚡ NULL-first Sortierung: aktiv — nie gecrawlte Rules zuerst")
+    logger.info(f"⚡ Pagination Fix: aktiv — fetch_all_rules() umgeht 1000-Row-Limit")
     logger.info("✅ API is ready!")
 
 

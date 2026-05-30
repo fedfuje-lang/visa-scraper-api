@@ -11,6 +11,9 @@ v2.3.0 - Drei Qualitäts-Fixes:
 v2.2.0 - Encoding Fix: UTF-8 first, Fallback auf deklariertes Encoding
 v2.1.0 - Batch Limit 15, Semaphore(8)
 v2.0.0 - httpx Standard, Playwright Fallback, PDF Support
+v2.4.0 - Null-Byte Fix: clean_text() entfernt Null-Bytes und Steuerzeichen
+         aus allen Markdown-Outputs bevor sie zurückgegeben werden.
+         Verhindert Supabase-Fehler "null character not permitted".
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -56,6 +59,19 @@ async def get_http_client() -> httpx.AsyncClient:
             }
         )
     return _http_client
+
+
+# =============================================================================
+# v2.4.0: NULL-BYTE BEREINIGUNG
+# Entfernt Null-Bytes (\x00) und andere unerlaubte Steuerzeichen aus Strings.
+# Verhindert Supabase-Fehler: "null character not permitted" (PostgreSQL Code 54000)
+# Erlaubt: \t (Tab), \n (Newline), \r (Carriage Return) — alles andere unter \x20 raus.
+# =============================================================================
+
+def clean_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    return re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
 
 
 # =============================================================================
@@ -281,7 +297,6 @@ def html_to_markdown(html: str, url: str = "") -> str:
     Trafilatura für saubere Texte (70-80% der Fälle),
     BS4 als sicheres Fallback wenn Trafilatura zu wenig extrahiert.
     """
-    # 1. Trafilatura versuchen
     try:
         traf_markdown = trafilatura.extract(
             html,
@@ -291,7 +306,6 @@ def html_to_markdown(html: str, url: str = "") -> str:
             output_format="markdown"
         )
 
-        # 2. Qualitäts-Check: mind. 40 Wörter Kerninhalt
         if traf_markdown:
             word_count = len(traf_markdown.split())
             if word_count >= 40:
@@ -301,7 +315,6 @@ def html_to_markdown(html: str, url: str = "") -> str:
     except Exception as e:
         logger.warning(f"⚠️ Trafilatura Fehler für {url}: {str(e)}")
 
-    # 3. BS4 Fallback
     logger.info(f"🛡️ BS4 Fallback aktiv für: {url}")
     return html_to_markdown_bs4(html, url)
 
@@ -348,7 +361,6 @@ def _convert_element(element, lines: list, depth: int = 0, url: str = ""):
         text = element.get_text(" ", strip=True)
         href = element.get("href", "").strip()
 
-        # FIX 1 (v2.3.0): Relative Links zu absoluten Links machen
         if href and url:
             href = urljoin(url, href)
 
@@ -395,7 +407,6 @@ def _convert_table(table_element) -> str:
         if not cells:
             continue
 
-        # FIX 2 (v2.3.0): Colspan berücksichtigen — verbundene Zellen auffüllen
         cell_texts = []
         for cell in cells:
             text = cell.get_text(" ", strip=True).replace("|", "\\|")
@@ -476,7 +487,8 @@ async def fetch_and_convert(url: str) -> dict:
             markdown = pdf_text_to_markdown(pdf_text, url)
             quality = calculate_quality_score(markdown)
             return {
-                "data": markdown, "url": url, "content_type": "pdf",
+                "data": clean_text(markdown),  # v2.4.0: Null-Byte Fix
+                "url": url, "content_type": "pdf",
                 "quality_score": quality["final_score"], "quality_details": quality,
                 "success": True, "error": None
             }
@@ -502,7 +514,8 @@ async def fetch_and_convert(url: str) -> dict:
                     markdown = pdf_text_to_markdown(pdf_text, url)
                     quality = calculate_quality_score(markdown)
                     return {
-                        "data": markdown, "url": url, "content_type": "pdf",
+                        "data": clean_text(markdown),  # v2.4.0: Null-Byte Fix
+                        "url": url, "content_type": "pdf",
                         "quality_score": quality["final_score"], "quality_details": quality,
                         "success": True, "error": None
                     }
@@ -527,14 +540,14 @@ async def fetch_and_convert(url: str) -> dict:
         if pw_html:
             html = pw_html
 
-    # v2.3.0: Trafilatura Hybrid statt direktem BS4-Aufruf
     markdown = html_to_markdown(html, url)
     quality = calculate_quality_score(markdown)
 
     logger.info(f"✅ Fetched {url} → {quality['word_count']} words, score: {quality['final_score']}/10")
 
     return {
-        "data": markdown, "url": url, "content_type": "html",
+        "data": clean_text(markdown),  # v2.4.0: Null-Byte Fix
+        "url": url, "content_type": "html",
         "quality_score": quality["final_score"], "quality_details": quality,
         "success": True, "error": None
     }
@@ -572,6 +585,7 @@ class BatchRequest(BaseModel):
 async def fetch_markdown_batch(request: BatchRequest):
     """
     BATCH ENDPOINT – bis zu 15 URLs parallel
+    v2.4.0: Null-Byte Fix via clean_text() in fetch_and_convert()
     v2.3.0: Trafilatura Hybrid + Relative Links Fix + Colspan Fix
     """
     if not request.urls:

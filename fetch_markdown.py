@@ -14,6 +14,8 @@ v2.0.0 - httpx Standard, Playwright Fallback, PDF Support
 v2.4.0 - Null-Byte Fix: clean_text() entfernt Null-Bytes und Steuerzeichen
          aus allen Markdown-Outputs bevor sie zurückgegeben werden.
          Verhindert Supabase-Fehler "null character not permitted".
+v2.4.1 - Null-Byte Fix erweitert: clean_text() jetzt auch in allen Fehler-Returns
+         (html is None, Exception Handler, Batch Exception).
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -66,6 +68,7 @@ async def get_http_client() -> httpx.AsyncClient:
 # Entfernt Null-Bytes (\x00) und andere unerlaubte Steuerzeichen aus Strings.
 # Verhindert Supabase-Fehler: "null character not permitted" (PostgreSQL Code 54000)
 # Erlaubt: \t (Tab), \n (Newline), \r (Carriage Return) — alles andere unter \x20 raus.
+# v2.4.1: Wird jetzt auch in allen Fehler-Returns verwendet.
 # =============================================================================
 
 def clean_text(text: str) -> str:
@@ -487,14 +490,14 @@ async def fetch_and_convert(url: str) -> dict:
             markdown = pdf_text_to_markdown(pdf_text, url)
             quality = calculate_quality_score(markdown)
             return {
-                "data": clean_text(markdown),  # v2.4.0: Null-Byte Fix
+                "data": clean_text(markdown),
                 "url": url, "content_type": "pdf",
                 "quality_score": quality["final_score"], "quality_details": quality,
                 "success": True, "error": None
             }
         else:
             return {
-                "data": f"[PDF-Extraktion fehlgeschlagen]\nURL: {url}",
+                "data": clean_text(f"[PDF-Extraktion fehlgeschlagen]\nURL: {url}"),
                 "url": url, "content_type": "pdf", "quality_score": 0,
                 "quality_details": {"quality_status": "pdf_extraction_failed", "word_count": 0},
                 "success": False, "error": "PDF text extraction failed"
@@ -514,7 +517,7 @@ async def fetch_and_convert(url: str) -> dict:
                     markdown = pdf_text_to_markdown(pdf_text, url)
                     quality = calculate_quality_score(markdown)
                     return {
-                        "data": clean_text(markdown),  # v2.4.0: Null-Byte Fix
+                        "data": clean_text(markdown),
                         "url": url, "content_type": "pdf",
                         "quality_score": quality["final_score"], "quality_details": quality,
                         "success": True, "error": None
@@ -528,7 +531,7 @@ async def fetch_and_convert(url: str) -> dict:
 
     if html is None:
         return {
-            "data": f"[Seite konnte nicht geladen werden]\nURL: {url}",
+            "data": clean_text(f"[Seite konnte nicht geladen werden]\nURL: {url}"),  # v2.4.1
             "url": url, "content_type": "error", "quality_score": 0,
             "quality_details": {"quality_status": "fetch_error", "word_count": 0},
             "success": False, "error": "Both httpx and Playwright failed"
@@ -546,7 +549,7 @@ async def fetch_and_convert(url: str) -> dict:
     logger.info(f"✅ Fetched {url} → {quality['word_count']} words, score: {quality['final_score']}/10")
 
     return {
-        "data": clean_text(markdown),  # v2.4.0: Null-Byte Fix
+        "data": clean_text(markdown),
         "url": url, "content_type": "html",
         "quality_score": quality["final_score"], "quality_details": quality,
         "success": True, "error": None
@@ -570,10 +573,10 @@ async def fetch_markdown_endpoint(url: str = Query(..., description="URL to fetc
     except Exception as e:
         logger.error(f"❌ Error fetching {url}: {str(e)}")
         return {
-            "data": f"[Fehler]\nURL: {url}\nFehler: {str(e)}",
+            "data": clean_text(f"[Fehler]\nURL: {url}\nFehler: {str(e)}"),  # v2.4.1
             "url": url, "content_type": "error", "quality_score": 0,
             "quality_details": {"quality_status": "fetch_error", "word_count": 0},
-            "success": False, "error": str(e)
+            "success": False, "error": clean_text(str(e))
         }
 
 
@@ -585,6 +588,7 @@ class BatchRequest(BaseModel):
 async def fetch_markdown_batch(request: BatchRequest):
     """
     BATCH ENDPOINT – bis zu 15 URLs parallel
+    v2.4.1: clean_text() jetzt auch in allen Fehler-Returns
     v2.4.0: Null-Byte Fix via clean_text() in fetch_and_convert()
     v2.3.0: Trafilatura Hybrid + Relative Links Fix + Colspan Fix
     """
@@ -610,10 +614,10 @@ async def fetch_markdown_batch(request: BatchRequest):
         if isinstance(result, Exception):
             logger.error(f"❌ Batch item {i} failed: {str(result)}")
             results.append({
-                "data": f"[Fehler]\nURL: {urls[i]}\nFehler: {str(result)}",
+                "data": clean_text(f"[Fehler]\nURL: {urls[i]}\nFehler: {str(result)}"),  # v2.4.1
                 "url": urls[i], "content_type": "error", "quality_score": 0,
                 "quality_details": {"quality_status": "fetch_error", "word_count": 0},
-                "success": False, "error": str(result)
+                "success": False, "error": clean_text(str(result))
             })
         else:
             results.append(result)

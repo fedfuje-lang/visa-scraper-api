@@ -3,7 +3,7 @@ fetch_apis.py – Generischer API Fetcher für GROUP B: FINANZEN
 FastAPI Router deployed on Railway.app
 
 Liest Regeln aus config_apis + Länderliste aus config_rules (bewährt)
-Schreibt DIREKT in data_group_b_finanzen (kein Umweg über discovered_urls/WF2)
+Schreibt DIREKT in smart_country_data (Single Source of Truth)
 
 Provider-Support:
   - World Bank  (global, Jahreswerte → /12)
@@ -13,14 +13,12 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
-v3.0.0 – 2026-04-23
-  NEU: OECD SDMX Fetcher (CP04 Utility, CP07 Transport)
-  NEU: Eurostat Fetcher (nrg_pc_204 kWh-Preis → Monatskosten)
-  NEU: StatCan Fetcher (CPI CSV Tabellen)
-  NEU: ONS Fetcher (CPIH JSON Beta API)
-  NEU: Transformation Engine erweitert um CPI-Index und kWh-Logik
-  NEU: Währungsumrechnung via ExchangeRate-API (kostenlos, kein Key)
-  FIX: country_codes Filter wird direkt in Supabase-Query angewendet
+v4.0.0 – 2026-06-06
+  ÄNDERUNG: Schreibt jetzt direkt in smart_country_data statt data_group_b_finanzen
+  ÄNDERUNG: Interne Felder (rule_id, source_url, url_id, extraction_quality,
+            raw_extraction_json, confidence_score, updated_at) werden vor
+            dem Upsert herausgefiltert
+  Alle anderen Fetcher, Transformer und Provider-Logiken unverändert
 """
 
 from fastapi import APIRouter
@@ -48,6 +46,20 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # =============================================================================
+# Interne Felder die NICHT in smart_country_data geschrieben werden
+# =============================================================================
+
+INTERNAL_FIELDS = {
+    'rule_id',
+    'source_url',
+    'url_id',
+    'extraction_quality',
+    'raw_extraction_json',
+    'confidence_score',
+    'updated_at',
+}
+
+# =============================================================================
 # WÄHRUNGS-BASISWERTE (Fallback falls ExchangeRate-API nicht erreichbar)
 # Werden beim Start aktualisiert via fetch_exchange_rates()
 # =============================================================================
@@ -67,19 +79,17 @@ EXCHANGE_RATES_TO_USD = {
 }
 
 # CPI-Basiswerte für Index-zu-USD Umrechnung (2015=100 Basis)
-# Werden genutzt wenn OECD/ONS/StatCan nur einen Index liefern
-# Format: country_code -> {field -> base_usd_value}
 CPI_BASE_VALUES = {
     "AU": {
-        "cost_transport_month_tier1_avg_usd_num": 95.0,   # AUD ~147 / 1.55
-        "cost_utility_month_avg_usd_num": 160.0,          # AUD ~247 / 1.55
+        "cost_transport_month_tier1_avg_usd_num": 95.0,
+        "cost_utility_month_avg_usd_num": 160.0,
     },
     "CA": {
-        "cost_transport_month_tier1_avg_usd_num": 100.0,  # CAD ~137 * 0.73
+        "cost_transport_month_tier1_avg_usd_num": 100.0,
         "cost_utility_month_avg_usd_num": 145.0,
     },
     "DE": {
-        "cost_transport_month_tier1_avg_usd_num": 55.0,   # EUR ~51 * 1.08
+        "cost_transport_month_tier1_avg_usd_num": 55.0,
         "cost_utility_month_avg_usd_num": 290.0,
     },
     "ES": {
@@ -91,7 +101,7 @@ CPI_BASE_VALUES = {
         "cost_utility_month_avg_usd_num": 185.0,
     },
     "GB": {
-        "cost_transport_month_tier1_avg_usd_num": 200.0,  # GBP ~158 * 1.27
+        "cost_transport_month_tier1_avg_usd_num": 200.0,
         "cost_utility_month_avg_usd_num": 320.0,
     },
     "AT": {
@@ -133,7 +143,6 @@ async def fetch_exchange_rates(client: httpx.AsyncClient) -> dict:
         data = r.json()
         if data.get("result") == "success":
             rates = data.get("rates", {})
-            # Umkehren: wir wollen X → USD, die API liefert USD → X
             usd_rates = {
                 currency: 1.0 / rate
                 for currency, rate in rates.items()
@@ -152,7 +161,7 @@ def convert_to_usd(value: float, currency: str, rates: dict) -> float:
 
 
 # =============================================================================
-# TRANSFORMATION ENGINE (erweitert v3.0)
+# TRANSFORMATION ENGINE
 # =============================================================================
 
 def apply_transformation(
@@ -165,12 +174,6 @@ def apply_transformation(
     currency: Optional[str] = None,
     exchange_rates: Optional[dict] = None,
 ) -> Optional[float]:
-    """
-    Transformation Engine — unterstützt:
-    - World Bank: divide_by_12[_multiply_X]
-    - OECD/StatCan/ONS: cpi_index_to_usd_convert
-    - Eurostat: kwh_price_multiply_250_plus_30pct_convert_usd
-    """
     if value is None:
         return None
 
@@ -179,9 +182,6 @@ def apply_transformation(
     try:
         t = (transformation or "").strip().lower()
 
-        # ------------------------------------------------------------------
-        # WORLD BANK: Jahreswert / 12 * Multiplikator
-        # ------------------------------------------------------------------
         if multiplier_pct is not None and t not in (
             "cpi_index_to_usd_convert",
             "kwh_price_multiply_250_plus_30pct_convert_usd",
@@ -192,38 +192,23 @@ def apply_transformation(
                 result += float(offset_usd)
             return round(result, 2)
 
-        # ------------------------------------------------------------------
-        # OECD / StatCan / ONS: CPI-Index → absoluter USD-Betrag
-        # Index 2015=100 → Basiswert * (Index/100)
-        # ------------------------------------------------------------------
         if t in ("cpi_index_to_usd_convert", "cpi_transport_index_to_usd_convert"):
             if not country_code or not db_field:
                 logger.warning("⚠️ cpi_index_to_usd_convert braucht country_code + db_field")
                 return None
-
             base = CPI_BASE_VALUES.get(country_code, {}).get(db_field)
             if base is None:
                 logger.warning(f"⚠️ Kein CPI-Basiswert für {country_code}/{db_field}")
                 return None
-
-            # value = CPI-Index (z.B. 118.4)
             result = base * (value / 100.0)
             return round(result, 2)
 
-        # ------------------------------------------------------------------
-        # EUROSTAT: kWh-Preis → monatliche Utility-Kosten
-        # Formel: kWh_preis * 250 kWh/Monat * 1.30 (Gas+Wasser+Heizung) → EUR → USD
-        # ------------------------------------------------------------------
         if t == "kwh_price_multiply_250_plus_30pct_convert_usd":
-            # value = EUR pro kWh (z.B. 0.38 für DE)
-            monthly_electricity = value * 250          # 250 kWh/Monat für 85m²
-            monthly_total = monthly_electricity * 1.30  # +30% für Gas/Wasser/Heizung
+            monthly_electricity = value * 250
+            monthly_total = monthly_electricity * 1.30
             usd = convert_to_usd(monthly_total, currency or "EUR", rates)
             return round(usd, 2)
 
-        # ------------------------------------------------------------------
-        # STANDARD World Bank Transformationen
-        # ------------------------------------------------------------------
         if t == "divide_by_12":
             return round(value / 12, 2)
         elif t == "divide_by_12_multiply_1.3":
@@ -319,19 +304,12 @@ async def fetch_bls_value(
 
 # =============================================================================
 # OECD SDMX FETCHER
-# Format: jsondata
-# Response: data.dataSets[0].observations → {key: [value, ...]}
 # =============================================================================
 
 async def fetch_oecd_value(
     endpoint_url: str,
     client: httpx.AsyncClient
 ) -> Optional[float]:
-    """
-    Holt CPI-Index von OECD SDMX API.
-    Erwartet format=jsondata in der URL.
-    Gibt den neuesten Beobachtungswert zurück.
-    """
     try:
         r = await client.get(endpoint_url, timeout=20.0, headers={
             "Accept": "application/vnd.sdmx.data+json;version=1.0"
@@ -339,7 +317,6 @@ async def fetch_oecd_value(
         r.raise_for_status()
         data = r.json()
 
-        # SDMX-JSON Struktur: dataSets[0].observations = {"0:0:..": [value, status]}
         datasets = data.get("dataSets", [])
         if not datasets:
             logger.warning(f"⚠️ OECD: keine dataSets in Response für {endpoint_url}")
@@ -350,7 +327,6 @@ async def fetch_oecd_value(
             logger.warning(f"⚠️ OECD: keine observations für {endpoint_url}")
             return None
 
-        # Letzten Wert nehmen (observations sind dict mit key→[value, status])
         values = []
         for obs_key, obs_data in observations.items():
             if obs_data and obs_data[0] is not None:
@@ -359,7 +335,6 @@ async def fetch_oecd_value(
         if not values:
             return None
 
-        # Neuesten Wert (letzter in der Liste)
         return values[-1]
 
     except Exception as e:
@@ -369,18 +344,12 @@ async def fetch_oecd_value(
 
 # =============================================================================
 # EUROSTAT FETCHER
-# Dataset: nrg_pc_204 – Electricity prices for household consumers
-# Gibt kWh-Preis in EUR zurück
 # =============================================================================
 
 async def fetch_eurostat_value(
     endpoint_url: str,
     client: httpx.AsyncClient
 ) -> Optional[float]:
-    """
-    Holt Strompreis (EUR/kWh) von Eurostat SDMX API.
-    Gibt den neuesten Wert zurück.
-    """
     try:
         r = await client.get(endpoint_url, timeout=20.0, headers={
             "Accept": "application/json"
@@ -388,7 +357,6 @@ async def fetch_eurostat_value(
         r.raise_for_status()
         data = r.json()
 
-        # Eurostat SDMX-JSON: gleiche Struktur wie OECD
         datasets = data.get("dataSets", [])
         if not datasets:
             logger.warning(f"⚠️ Eurostat: keine dataSets für {endpoint_url}")
@@ -416,23 +384,16 @@ async def fetch_eurostat_value(
 
 # =============================================================================
 # STATCAN FETCHER (Kanada)
-# CSV-Download von Statistics Canada
-# Gibt CPI-Index zurück
 # =============================================================================
 
 async def fetch_statcan_value(
     endpoint_url: str,
     client: httpx.AsyncClient
 ) -> Optional[float]:
-    """
-    Holt CPI-Index-Wert von Statistics Canada (CSV-Download).
-    Filtert nach der neuesten Periode und gibt den Index-Wert zurück.
-    """
     try:
         r = await client.get(endpoint_url, timeout=30.0)
         r.raise_for_status()
 
-        # CSV parsen
         content = r.text
         reader = csv.DictReader(io.StringIO(content))
 
@@ -441,9 +402,7 @@ async def fetch_statcan_value(
             logger.warning(f"⚠️ StatCan: leere CSV für {endpoint_url}")
             return None
 
-        # Letzte Zeile mit einem gültigen Wert
         for row in reversed(rows):
-            # StatCan CSV hat typischerweise "VALUE" oder "value" Spalte
             val = row.get("VALUE") or row.get("value") or row.get("Value")
             if val and val.strip() not in ("", "."):
                 try:
@@ -461,18 +420,12 @@ async def fetch_statcan_value(
 
 # =============================================================================
 # ONS FETCHER (UK)
-# Beta API von Office for National Statistics
-# Gibt CPIH-Index zurück
 # =============================================================================
 
 async def fetch_ons_value(
     endpoint_url: str,
     client: httpx.AsyncClient
 ) -> Optional[float]:
-    """
-    Holt CPIH-Index von UK ONS Beta API.
-    Gibt den neuesten Beobachtungswert zurück.
-    """
     try:
         r = await client.get(endpoint_url, timeout=20.0, headers={
             "Accept": "application/json"
@@ -480,13 +433,11 @@ async def fetch_ons_value(
         r.raise_for_status()
         data = r.json()
 
-        # ONS Beta API: {"observations": [{"observation": "123.4", "time": "2024"}, ...]}
         observations = data.get("observations", [])
         if not observations:
             logger.warning(f"⚠️ ONS: keine observations für {endpoint_url}")
             return None
 
-        # Neueste Beobachtung (letzte in der Liste)
         for obs in reversed(observations):
             val = obs.get("observation")
             if val and val not in ("", ".", "N/A"):
@@ -504,7 +455,7 @@ async def fetch_ons_value(
 
 
 # =============================================================================
-# PROVIDER ROUTER — erkennt Provider und ruft richtigen Fetcher auf
+# PROVIDER ROUTER
 # =============================================================================
 
 async def fetch_value_for_rule(
@@ -551,7 +502,6 @@ async def fetch_value_for_rule(
 # =============================================================================
 
 def get_currency_for_rule(rule: dict, country: dict) -> str:
-    """Bestimmt die Ausgangswährung basierend auf Provider und Land."""
     provider = rule["provider"].lower()
     country_code = country.get("country_code", "")
 
@@ -561,11 +511,9 @@ def get_currency_for_rule(rule: dict, country: dict) -> str:
     currency_map = {
         "AU": "AUD", "CA": "CAD", "GB": "GBP",
         "US": "USD", "RU": "RUB", "SA": "SAR", "AE": "AED",
-        # Euro-Länder
         "DE": "EUR", "FR": "EUR", "ES": "EUR", "IT": "EUR",
         "AT": "EUR", "NL": "EUR", "PT": "EUR", "BE": "EUR",
         "FI": "EUR", "IE": "EUR", "GR": "EUR",
-        # Andere
         "SE": "SEK", "PL": "PLN", "CH": "CHF",
         "NO": "NOK", "DK": "DKK",
     }
@@ -602,7 +550,7 @@ async def process_country(
     async with httpx.AsyncClient(
         timeout=20.0,
         follow_redirects=True,
-        headers={"User-Agent": "VisaScraper/3.0 fetch-apis"}
+        headers={"User-Agent": "VisaScraper/4.0 fetch-apis"}
     ) as client:
         tasks = [
             fetch_value_for_rule(rule, country, client)
@@ -610,34 +558,32 @@ async def process_country(
         ]
         raw_values = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Upsert-Dict aufbauen — nur Felder die in smart_country_data existieren
     upsert_data = {
         "country_code": country_code,
         "country_name": country_name,
-        "rule_id": f"{country_code}-COSTS",
-        "source_url": "api://fetch-apis",
-        "updated_at": today,
     }
 
     fields_written = 0
     fields_null = 0
 
     for rule, raw_value in zip(relevant_rules, raw_values):
-        db_field    = rule["db_field"]
+        db_field     = rule["db_field"]
         source_field = db_field + "_source"
         date_field   = db_field + "_date"
 
         if isinstance(raw_value, Exception):
             logger.warning(f"⚠️ Exception für {rule['api_id']}: {raw_value}")
-            upsert_data[db_field] = None
+            upsert_data[db_field]     = None
             upsert_data[source_field] = None
-            upsert_data[date_field] = None
+            upsert_data[date_field]   = None
             fields_null += 1
             continue
 
         if raw_value is None:
-            upsert_data[db_field] = None
+            upsert_data[db_field]     = None
             upsert_data[source_field] = None
-            upsert_data[date_field] = None
+            upsert_data[date_field]   = None
             fields_null += 1
             continue
 
@@ -655,29 +601,32 @@ async def process_country(
         )
 
         if transformed_value is not None:
-            upsert_data[db_field] = transformed_value
+            upsert_data[db_field]     = transformed_value
             upsert_data[source_field] = rule["source_label"]
-            upsert_data[date_field] = today
+            upsert_data[date_field]   = today
             fields_written += 1
             logger.info(
                 f"  ✅ {db_field} = {transformed_value} "
                 f"(raw: {raw_value}, provider: {rule['provider']})"
             )
         else:
-            upsert_data[db_field] = None
+            upsert_data[db_field]     = None
             upsert_data[source_field] = None
-            upsert_data[date_field] = None
+            upsert_data[date_field]   = None
             fields_null += 1
 
+    # Interne Felder herausfiltern bevor Upsert nach smart_country_data
+    smart_data = {k: v for k, v in upsert_data.items() if k not in INTERNAL_FIELDS}
+
     try:
-        supabase.table("data_group_b_finanzen").upsert(
-            upsert_data,
+        supabase.table("smart_country_data").upsert(
+            smart_data,
             on_conflict="country_code"
         ).execute()
 
         logger.info(
             f"✅ {country_name}: {fields_written} Felder geschrieben, "
-            f"{fields_null} null"
+            f"{fields_null} null → smart_country_data"
         )
         return {
             "country_code": country_code,
@@ -709,7 +658,7 @@ class FetchApisRequest(BaseModel):
 @router.post("/fetch-apis")
 async def fetch_apis(request: FetchApisRequest):
     """
-    Holt API-Daten für GROUP B: FINANZEN und schreibt direkt in data_group_b_finanzen.
+    Holt API-Daten für GROUP B: FINANZEN und schreibt direkt in smart_country_data.
 
     POST /fetch-apis
     Option A: { "country_codes": ["US", "DE", "AU"] }  → spezifische Länder
@@ -722,15 +671,11 @@ async def fetch_apis(request: FetchApisRequest):
             "error": "Provide either 'country_codes' or 'fetch_all_active': true"
         }
 
-    # -------------------------------------------------------------------------
     # Wechselkurse laden (einmal pro Run)
-    # -------------------------------------------------------------------------
     async with httpx.AsyncClient(timeout=10.0) as fx_client:
         exchange_rates = await fetch_exchange_rates(fx_client)
 
-    # -------------------------------------------------------------------------
     # Länder laden
-    # -------------------------------------------------------------------------
     try:
         query = supabase.table("config_rules").select(
             "rule_id, country_name, country_iso"
@@ -775,9 +720,7 @@ async def fetch_apis(request: FetchApisRequest):
         logger.error(f"❌ Länder-Abfrage fehlgeschlagen: {e}")
         return {"success": False, "error": str(e)}
 
-    # -------------------------------------------------------------------------
     # API-Regeln laden
-    # -------------------------------------------------------------------------
     try:
         rules_resp = supabase.table("config_apis").select("*").eq("active", True).execute()
         api_rules = [
@@ -794,9 +737,7 @@ async def fetch_apis(request: FetchApisRequest):
         logger.error(f"❌ config_apis Abfrage fehlgeschlagen: {e}")
         return {"success": False, "error": str(e)}
 
-    # -------------------------------------------------------------------------
     # Länder verarbeiten
-    # -------------------------------------------------------------------------
     results = []
     for country in countries:
         result = await process_country(country, api_rules, exchange_rates)
@@ -806,13 +747,13 @@ async def fetch_apis(request: FetchApisRequest):
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v3.0: {successful}/{len(results)} Länder, "
-        f"{total_fields} Felder total"
+        f"🏁 fetch-apis v4.0: {successful}/{len(results)} Länder, "
+        f"{total_fields} Felder total → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "3.0.0",
+        "version": "4.0.0",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

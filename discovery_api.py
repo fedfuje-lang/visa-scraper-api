@@ -45,6 +45,14 @@ v3.3.0 - Pagination Fix: Supabase liefert standardmäßig max. 1000 Rows. Bei 12
          fetch_all_rules() holt alle Rules via .range()-Pagination in 1000er-Batches.
          Sortierung jetzt direkt in DB via .order('last_crawled_at', nullsfirst=True) —
          kein Python-Sort mehr nötig. NULL-Rules kommen garantiert in jedem Run an.
+v3.4.0 - Trigger Fix + Timestamp Fix:
+         1. target_url nicht mehr in discovered_urls schreiben — Postgres Trigger
+            trg_config_rules_insert_discovered übernimmt das zuverlässig beim INSERT/UPDATE
+            auf config_rules. save_urls_to_supabase() speichert nur noch Sub-Links
+            (is_main_url=False). Kein doppelter Eintrag mehr möglich.
+         2. last_crawled_at nur bei Erfolg setzen (saved_count > 0) — Rules die 0
+            Sub-Links liefern bekommen keinen Timestamp und werden beim nächsten Run
+            erneut verarbeitet. Eindeutiger Zustand: Timestamp = wirklich gecrawlt.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -74,7 +82,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.3.0"  # v3.3.0: Pagination Fix
+    version="3.4.0"  # v3.4.0: Trigger Fix + Timestamp Fix
 )
 
 app.add_middleware(
@@ -100,13 +108,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # v3.0.0: JOB STORE — speichert laufende und abgeschlossene Jobs im RAM
 # =============================================================================
 
-# Format: { "job_id": { "status": "running"|"completed"|"failed",
-#                       "total_rules": 100, "processed_rules": 42,
-#                       "skipped_rules": 10, "total_urls_found": 1500,
-#                       "successful_rules": 40, "failed_rules": 2,
-#                       "started_at": "...", "finished_at": None,
-#                       "current_country": "Portugal",
-#                       "results_per_rule": [...] } }
 JOB_STORE: Dict[str, Dict] = {}
 
 # =============================================================================
@@ -212,17 +213,12 @@ def get_today_start_utc() -> str:
 
 # =============================================================================
 # v3.3.0: PAGINATION FIX — holt ALLE Rules aus Supabase (nicht nur die ersten 1000)
-# Supabase liefert standardmäßig max. 1000 Rows. Bei 1276 aktiven Rules wurden
-# die 214 NULL-Rules (Position 1001-1276 bei NULLS LAST) nie geliefert.
-# Lösung: .range()-Pagination in 1000er-Batches + Sortierung direkt in DB.
 # =============================================================================
 
 def fetch_all_rules(base_query) -> List[Dict]:
     """
     Holt alle aktiven Rules via Pagination — umgeht das 1000-Row-Limit von Supabase.
     Sortierung: NULL zuerst (nie gecrawlte Rules), dann älteste Timestamps aufsteigend.
-    base_query: bereits gebaute Query (mit .eq('active', True) und optionalen Filtern),
-                OHNE .execute() — diese Funktion fügt .order() und .range() hinzu.
     """
     all_rules = []
     page_size = 1000
@@ -241,7 +237,7 @@ def fetch_all_rules(base_query) -> List[Dict]:
         all_rules.extend(batch)
         logger.info(f"📦 Pagination: {len(batch)} Rules geladen (offset {offset}, gesamt bisher: {len(all_rules)})")
         if len(batch) < page_size:
-            break  # Letzte Seite erreicht
+            break
         offset += page_size
 
     logger.info(f"✅ fetch_all_rules: {len(all_rules)} Rules total geladen")
@@ -442,10 +438,13 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             url_lower = url.lower()
             is_pdf = url_lower.endswith(".pdf") or ".pdf?" in url_lower
             if is_pdf:
+                # v3.4.0: target_url (is_main_url=True) wird vom Trigger geschrieben — hier überspringen
+                if is_target:
+                    return url, depth, is_target, None, []
                 return url, depth, is_target, {
                     "url": url,
                     "page_title": url.split("/")[-1][:500],
-                    "is_main_url": is_target,
+                    "is_main_url": False,
                     "discovered_depth": depth,
                     "rule_id": rule['rule_id'],
                     "country_code": rule['country_iso'],
@@ -476,18 +475,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 html = await fetch_html_playwright(url, playwright_browser)
 
             if not html:
-                if is_target:
-                    logger.warning(f"⚠️ Target URL konnte nicht geladen werden, trotzdem gespeichert: {url}")
-                    return url, depth, is_target, {
-                        "url": url,
-                        "page_title": "",
-                        "is_main_url": True,
-                        "discovered_depth": depth,
-                        "rule_id": rule['rule_id'],
-                        "country_code": rule['country_iso'],
-                        "country_name": rule['country_name'],
-                        "target_group": rule['target_group']
-                    }, []
+                # v3.4.0: target_url wird vom Trigger geschrieben — kein Fallback-Eintrag nötig
                 return url, depth, is_target, None, []
 
             soup = BeautifulSoup(html, "html.parser")
@@ -507,10 +495,16 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
                         child_links.append(normalized_full)
 
+            # v3.4.0: target_url (is_main_url=True) nicht in discovered_urls schreiben —
+            # Postgres Trigger trg_config_rules_insert_discovered übernimmt das.
+            # Nur Sub-Links (is_main_url=False) werden gespeichert.
+            if is_target:
+                return url, depth, is_target, None, child_links
+
             result = {
                 "url": url,
                 "page_title": page_title[:500],
-                "is_main_url": is_target,
+                "is_main_url": False,
                 "discovered_depth": depth,
                 "rule_id": rule['rule_id'],
                 "country_code": rule['country_iso'],
@@ -554,7 +548,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     if playwright_instance:
         await playwright_instance.stop()
 
-    logger.info(f"✅ [{rule['rule_id']}] Discovery complete: {len(discovered_urls)} URLs (visited {len(visited)} pages)")
+    logger.info(f"✅ [{rule['rule_id']}] Discovery complete: {len(discovered_urls)} Sub-Links (visited {len(visited)} pages)")
     return discovered_urls
 
 
@@ -563,15 +557,23 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
+    """
+    v3.4.0: Speichert nur Sub-Links (is_main_url=False).
+    target_urls werden vom Postgres Trigger trg_config_rules_insert_discovered
+    automatisch in discovered_urls eingetragen — kein doppelter Eintrag.
+    """
     if not discovered_urls:
         return 0
 
-    logger.info(f"💾 Preparing to save {len(discovered_urls)} URLs to Supabase...")
+    logger.info(f"💾 Preparing to save {len(discovered_urls)} Sub-Links to Supabase...")
     seen_urls = set()
     insert_data = []
     duplicates_removed = 0
 
     for url_data in discovered_urls:
+        # v3.4.0: Sicherheitscheck — target_urls (is_main_url=True) nie schreiben
+        if url_data.get("is_main_url", False):
+            continue
         url = url_data["url"]
         if url in seen_urls:
             duplicates_removed += 1
@@ -580,7 +582,7 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
         insert_data.append({
             "url":              url,
             "page_title":       url_data["page_title"],
-            "is_main_url":      url_data["is_main_url"],
+            "is_main_url":      False,
             "discovered_depth": url_data["discovered_depth"],
             "rule_id":          url_data["rule_id"],
             "country_code":     url_data["country_code"],
@@ -603,13 +605,13 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
         logger.warning(f"⚠️ Could not check existing statuses: {str(e)}")
 
     if not insert_data:
-        logger.info("✅ No new URLs to save (all already chunked)")
+        logger.info("✅ No new Sub-Links to save (all already chunked or empty)")
         return 0
 
     try:
         response = supabase.table("discovered_urls").upsert(insert_data, on_conflict="url").execute()
         inserted_count = len(response.data) if response.data else 0
-        logger.info(f"✅ {inserted_count} URLs saved successfully")
+        logger.info(f"✅ {inserted_count} Sub-Links saved successfully")
         return inserted_count
     except Exception as e:
         logger.error(f"❌ Error saving to Supabase: {str(e)}")
@@ -626,14 +628,13 @@ def update_last_crawled(rule_id: str):
 
 # =============================================================================
 # v3.0.0: HINTERGRUND-JOB FUNKTION
-# Wird von asyncio.create_task() gestartet — läuft unabhängig von n8n-Verbindung
 # =============================================================================
 
 async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: Optional[int]):
     """
     Verarbeitet alle Rules im Hintergrund.
-    Aktualisiert JOB_STORE laufend damit /discover/status/{job_id} immer
-    den aktuellen Stand zurückgeben kann.
+    v3.4.0: last_crawled_at wird nur gesetzt wenn saved_count > 0 —
+    eindeutiger Zustand: Timestamp bedeutet wirklich gecrawlt, nicht nur versucht.
     """
     job = JOB_STORE[job_id]
     job["status"] = "running"
@@ -643,7 +644,6 @@ async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: O
 
     async def process_rule(rule: Dict, index: int) -> Dict:
         async with rule_semaphore:
-            # Aktuelles Land im Job-Status anzeigen
             job["current_country"] = f"{rule['country_name']} ({rule['rule_id']})"
             logger.info(f"▶️  [{job_id}] Rule {index}/{len(rules)}: {rule['rule_id']} – {rule['country_name']} / {rule['target_group']}")
 
@@ -653,13 +653,19 @@ async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: O
 
                 discovered = await discover_urls(rule)
                 saved_count = save_urls_to_supabase(discovered)
-                update_last_crawled(rule['rule_id'])
+
+                # v3.4.0: last_crawled_at nur bei Erfolg setzen
+                if saved_count > 0:
+                    update_last_crawled(rule['rule_id'])
+                    logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} Sub-Links — last_crawled_at gesetzt")
+                else:
+                    logger.info(f"⚠️ [{job_id}] Rule {rule['rule_id']}: 0 Sub-Links — last_crawled_at NICHT gesetzt, wird erneut versucht")
 
                 job["processed_rules"] += 1
                 job["successful_rules"] += 1
                 job["total_urls_found"] += saved_count
 
-                logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} URLs — {job['processed_rules']}/{job['total_rules']} Rules done")
+                logger.info(f"✅ [{job_id}] {job['processed_rules']}/{job['total_rules']} Rules done")
 
                 return {
                     "rule_id":      rule['rule_id'],
@@ -689,7 +695,7 @@ async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: O
         job["status"] = "completed"
         job["current_country"] = None
         job["finished_at"] = datetime.now(timezone.utc).isoformat()
-        logger.info(f"🎉 [{job_id}] Job completed: {job['total_urls_found']} URLs, {job['successful_rules']} rules OK, {job['failed_rules']} failed")
+        logger.info(f"🎉 [{job_id}] Job completed: {job['total_urls_found']} Sub-Links, {job['successful_rules']} rules OK, {job['failed_rules']} failed")
 
     except Exception as e:
         job["status"] = "failed"
@@ -726,7 +732,7 @@ class DiscoveryJobResponse(BaseModel):
 
 class DiscoveryStatusResponse(BaseModel):
     job_id: str
-    status: str                  # "running" | "completed" | "failed"
+    status: str
     total_rules: int
     processed_rules: int
     skipped_rules: int
@@ -736,7 +742,7 @@ class DiscoveryStatusResponse(BaseModel):
     current_country: Optional[str]
     started_at: str
     finished_at: Optional[str]
-    progress_pct: float          # 0.0 – 100.0
+    progress_pct: float
 
 class DirectDiscoveryResponse(BaseModel):
     success: bool
@@ -748,13 +754,12 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "status": "running",
-        "changes_v3.3.0": [
-            "Pagination Fix: fetch_all_rules() holt alle Rules via .range()-Batches",
-            "Supabase 1000-Row-Limit wird umgangen — alle 1276 Rules kommen an",
-            "Sortierung jetzt direkt in DB via .order(nullsfirst=True) statt Python-Sort",
-            "214 NULL-Rules (Costa Rica, Japan, UK etc.) werden jetzt verarbeitet",
+        "changes_v3.4.0": [
+            "target_url nicht mehr in discovered_urls geschrieben — Postgres Trigger übernimmt das",
+            "last_crawled_at nur bei saved_count > 0 gesetzt — eindeutiger Erfolgszustand",
+            "0 Sub-Links = kein Timestamp = nächster Run versucht es erneut",
         ]
     }
 
@@ -764,7 +769,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -772,18 +777,11 @@ async def health():
 
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
-    """
-    v3.3.0: fetch_all_rules() umgeht das Supabase 1000-Row-Limit via Pagination.
-    Alle 1276 aktiven Rules werden geladen — inkl. der 214 NULL-Rules.
-    Sortierung direkt in DB: NULL zuerst, dann älteste Timestamps aufsteigend.
-    """
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.3.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.4.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
-        # v3.3.0: Query bauen OHNE .execute() — fetch_all_rules() übernimmt das
-        # .order() und .range() werden in fetch_all_rules() hinzugefügt
         query = (
             supabase.table("config_rules")
             .select("*")
@@ -798,8 +796,6 @@ async def run_discovery(request: DiscoveryRequest):
             if "target_group" in request.filter:
                 query = query.eq("target_group", request.filter["target_group"])
 
-        # v3.3.0: fetch_all_rules() statt .execute() — holt alle Rules via Pagination
-        # NULL zuerst (nie gecrawlt), dann älteste Timestamps — direkt in DB sortiert
         all_rules = fetch_all_rules(query)
 
         if not all_rules:
@@ -845,7 +841,6 @@ async def run_discovery(request: DiscoveryRequest):
                                         skipped_rules=total_skipped,
                                         message="Alle Rules heute bereits gecrawlt oder GROUP B")
 
-        # Job anlegen
         job_id = str(uuid.uuid4())
         JOB_STORE[job_id] = {
             "status":           "queued",
@@ -861,7 +856,6 @@ async def run_discovery(request: DiscoveryRequest):
             "results_per_rule": [],
         }
 
-        # Job im Hintergrund starten — gibt sofort zurück
         asyncio.create_task(run_discovery_job(job_id, rules, request.max_urls))
 
         logger.info(f"✅ Job {job_id} gestartet: {len(rules)} Rules, {total_skipped} übersprungen")
@@ -881,10 +875,6 @@ async def run_discovery(request: DiscoveryRequest):
 
 @app.get("/discover/status/{job_id}", response_model=DiscoveryStatusResponse)
 async def get_discovery_status(job_id: str):
-    """
-    v3.0.0: Gibt aktuellen Stand eines laufenden oder abgeschlossenen Jobs zurück.
-    n8n pollt diesen Endpoint bis status='completed'.
-    """
     if job_id not in JOB_STORE:
         raise HTTPException(status_code=404, detail=f"Job {job_id} nicht gefunden")
 
@@ -932,7 +922,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
             }
             urls = await discover_urls(rule)
             discovered_urls.extend(urls)
-            logger.info(f"✅ Found {len(urls)} URLs from start URL {i}")
+            logger.info(f"✅ Found {len(urls)} Sub-Links from start URL {i}")
 
         saved_count = save_urls_to_supabase(discovered_urls)
         return DirectDiscoveryResponse(success=True, total_urls_found=saved_count, urls=discovered_urls)
@@ -948,7 +938,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.3.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.4.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
@@ -956,6 +946,8 @@ async def startup_event():
     logger.info(f"⚡ Same-Day Protection: aktiv")
     logger.info(f"⚡ Job-System: aktiv — /discover gibt sofort job_id zurück")
     logger.info(f"⚡ Pagination Fix: aktiv — fetch_all_rules() umgeht 1000-Row-Limit")
+    logger.info(f"⚡ Trigger Fix: aktiv — target_url wird vom Postgres Trigger geschrieben")
+    logger.info(f"⚡ Timestamp Fix: aktiv — last_crawled_at nur bei saved_count > 0")
     logger.info("✅ API is ready!")
 
 

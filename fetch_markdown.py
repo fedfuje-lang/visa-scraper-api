@@ -3,19 +3,39 @@ Fetch Markdown API - Jina Replacement
 FastAPI Endpoint deployed on Railway.app
 Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
-v2.3.0 - Drei Qualitäts-Fixes:
-  1. Relative Links Fix: urljoin für alle Links (keine PDF-Formulare mehr verloren)
-  2. Colspan Fix: Verbundene Tabellenzellen werden korrekt aufgefüllt
-  3. Trafilatura Hybrid: Trafilatura für saubere Texte, BS4 als sicheres Fallback
+v2.5.1 - Drei Robustheits-Fixes:
+  1. Markdown-Tabellen-Erkennung via Regex (\\|\\s*-{3,}) statt exaktem "| ---"
+     — im Tabellen-Wächter UND im Quality Score. Trafilatura gibt Separatoren
+     je nach Version auch ohne Leerzeichen aus (|---|); der exakte String-Match
+     hätte dann 0 gezählt → unnötiger BS4-Fallback bei jeder Tabellen-Seite
+     und um 2 Punkte zu niedrige Quality Scores.
+  2. PDF-Block-Filter: get_text("blocks") liefert auch Bild-Blöcke
+     (block_type 1, Text wie "<image: DeviceRGB...>"). Diese werden jetzt
+     übersprungen — keine Bild-Artefakte mehr im extrahierten Fließtext.
+  3. Batch Limit 15 → 20: passend zu WF2 "Get Pending URLs" (limit=20).
+     Bisher wurden die letzten 5 URLs jedes Zyklus kommentarlos verworfen
+     und im Folgezyklus erneut geholt (25% Leerlauf). Semaphore(8) bleibt —
+     die Parallelität regelt weiterhin die Queue, nicht das Batch-Limit.
 
+v2.5.0 - Drei Fakten-Extraktions-Fixes:
+  1. Trafilatura Tabellen-Wächter: Trafilatura-Output wird nur akzeptiert,
+     wenn keine Tabellen verloren gingen (HTML-Tabellen vs. Markdown-Tabellen)
+     und die Zahlen-Dichte nicht stark eingebrochen ist. Sonst BS4-Fallback.
+  2. PDF-Tabellenextraktion: page.find_tables() (PyMuPDF >= 1.23) erkennt
+     Tabellen in PDFs und gibt sie als Markdown-Tabellen aus. Fließtext
+     außerhalb der Tabellen bleibt erhalten, Reihenfolge nach Y-Position.
+     Fallback: bisheriges get_text()-Verhalten.
+  3. BS4-Tabellen-Konverter robust: rowspan + colspan werden korrekt
+     aufgefüllt, <br> in Zellen zerstört die Tabelle nicht mehr,
+     Header-Erkennung via <th> (synthetischer Header wenn keiner existiert),
+     alle Zeilen auf einheitliche Spaltenbreite gepolstert.
+
+v2.4.1 - Null-Byte Fix erweitert: clean_text() jetzt auch in allen Fehler-Returns
+v2.4.0 - Null-Byte Fix: clean_text() entfernt Null-Bytes und Steuerzeichen
+v2.3.0 - Relative Links Fix, Colspan Fix, Trafilatura Hybrid
 v2.2.0 - Encoding Fix: UTF-8 first, Fallback auf deklariertes Encoding
 v2.1.0 - Batch Limit 15, Semaphore(8)
 v2.0.0 - httpx Standard, Playwright Fallback, PDF Support
-v2.4.0 - Null-Byte Fix: clean_text() entfernt Null-Bytes und Steuerzeichen
-         aus allen Markdown-Outputs bevor sie zurückgegeben werden.
-         Verhindert Supabase-Fehler "null character not permitted".
-v2.4.1 - Null-Byte Fix erweitert: clean_text() jetzt auch in allen Fehler-Returns
-         (html is None, Exception Handler, Batch Exception).
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -78,6 +98,52 @@ def clean_text(text: str) -> str:
 
 
 # =============================================================================
+# v2.5.0: ZAHLEN-ZÄHLUNG (für Fix 1: Trafilatura Tabellen-Wächter)
+# =============================================================================
+
+def _count_numbers(text: str) -> int:
+    """Zählt Zahlen-Tokens in einem Text (Indikator für Fakten-Dichte)."""
+    if not text:
+        return 0
+    return len(re.findall(r'\b\d+[\.,]?\d*\b', text))
+
+
+# =============================================================================
+# v2.5.1 FIX 1: MARKDOWN-TABELLEN-ZÄHLUNG
+# Erkennt Tabellen-Separatoren unabhängig vom Format: "| ---", "|---|",
+# "| :--- |" etc. Ein exakter String-Match auf "| ---" verfehlt
+# Trafilatura-Output je nach Version komplett.
+# Wird im Tabellen-Wächter UND im Quality Score verwendet.
+# =============================================================================
+
+def _count_md_tables(text: str) -> int:
+    """
+    Zählt Markdown-Tabellen-Separatorzeilen (eine pro Tabelle).
+    Mindestens eine Pipe gefordert — sonst zählen <hr>-Linien ("---")
+    aus dem BS4-Konverter fälschlich als Tabelle.
+    """
+    if not text:
+        return 0
+    return len(re.findall(r'^\s*(?=.*\|)[\s:|]*-{3,}[\s:|-]*$', text, re.MULTILINE))
+
+
+def _html_content_numbers(html: str) -> int:
+    """
+    Zählt Zahlen im inhaltlichen Teil des HTML (ohne Navigation/Footer/Scripts).
+    Dient als Referenzwert: Verliert Trafilatura mehr als die Hälfte dieser
+    Zahlen, war die Extraktion zu aggressiv → BS4-Fallback.
+    """
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header",
+                         "aside", "noscript"]):
+            tag.decompose()
+        return _count_numbers(soup.get_text(" ", strip=True))
+    except Exception:
+        return 0
+
+
+# =============================================================================
 # PDF DETECTION + EXTRACTION
 # =============================================================================
 
@@ -88,6 +154,98 @@ def is_pdf_url(url: str) -> bool:
     if ".pdf?" in url_lower or ".pdf#" in url_lower:
         return True
     return False
+
+
+# =============================================================================
+# v2.5.0 FIX 2: PDF-TABELLENEXTRAKTION
+# page.find_tables() erkennt Tabellen, diese werden als Markdown-Tabellen
+# ausgegeben. Fließtext außerhalb der Tabellen-Bereiche wird per
+# get_text("blocks") extrahiert und nach vertikaler Position einsortiert.
+# Fallback bei jedem Fehler: page.get_text() wie bisher.
+# v2.5.1: Bild-Blöcke (block_type 1) werden übersprungen.
+# =============================================================================
+
+def _pdf_table_to_markdown(table) -> str:
+    """Konvertiert eine von PyMuPDF erkannte Tabelle in Markdown."""
+    try:
+        data = table.extract()
+    except Exception:
+        return ""
+
+    rows = []
+    for raw_row in data:
+        cells = []
+        for cell in raw_row:
+            text = (cell or "")
+            text = re.sub(r"\s+", " ", text).strip()
+            text = text.replace("|", "\\|")
+            cells.append(text)
+        if any(cells):
+            rows.append(cells)
+
+    if not rows:
+        return ""
+
+    width = max(len(r) for r in rows)
+    md_rows = []
+    for i, r in enumerate(rows):
+        r = r + [""] * (width - len(r))
+        md_rows.append("| " + " | ".join(r) + " |")
+        if i == 0:
+            md_rows.append("| " + " | ".join(["---"] * width) + " |")
+
+    return "\n".join(md_rows)
+
+
+def _pdf_page_to_markdown(page, fitz_module) -> str:
+    """
+    Extrahiert eine PDF-Seite mit Tabellen-Erkennung.
+    Tabellen → Markdown-Tabellen, restlicher Text → Fließtext,
+    Reihenfolge nach Y-Position auf der Seite.
+    """
+    try:
+        tab_finder = page.find_tables()
+        tables = list(tab_finder.tables) if tab_finder else []
+    except Exception as e:
+        logger.warning(f"⚠️ find_tables() fehlgeschlagen, nutze get_text(): {str(e)}")
+        tables = []
+
+    if not tables:
+        return page.get_text()
+
+    table_items = []   # (y0, markdown)
+    table_rects = []
+
+    for t in tables:
+        md = _pdf_table_to_markdown(t)
+        if md:
+            rect = fitz_module.Rect(t.bbox)
+            table_items.append((rect.y0, md))
+            table_rects.append(rect)
+
+    if not table_items:
+        return page.get_text()
+
+    # Fließtext-Blöcke außerhalb der Tabellen-Bereiche einsammeln
+    text_items = []
+    try:
+        for block in page.get_text("blocks"):
+            # v2.5.1: Bild-Blöcke überspringen (block_type 1 = Bild).
+            # Tuple-Format: (x0, y0, x1, y1, text, block_no, block_type)
+            if len(block) >= 7 and block[6] != 0:
+                continue
+            x0, y0, x1, y1, block_text = block[0], block[1], block[2], block[3], block[4]
+            block_rect = fitz_module.Rect(x0, y0, x1, y1)
+            if any(block_rect.intersects(tr) for tr in table_rects):
+                continue
+            block_text = block_text.strip()
+            if block_text:
+                text_items.append((y0, block_text))
+    except Exception as e:
+        logger.warning(f"⚠️ Block-Extraktion fehlgeschlagen: {str(e)}")
+
+    all_items = sorted(table_items + text_items, key=lambda item: item[0])
+    return "\n\n".join(item[1] for item in all_items)
 
 
 async def extract_pdf_text(url: str) -> Optional[str]:
@@ -109,7 +267,8 @@ async def extract_pdf_text(url: str) -> Optional[str]:
 
         try:
             doc = fitz.open(tmp_path)
-            text_parts = [page.get_text() for page in doc]
+            # v2.5.0: pro Seite Tabellen-Erkennung statt nur get_text()
+            text_parts = [_pdf_page_to_markdown(page, fitz) for page in doc]
             doc.close()
             full_text = "\n\n".join(text_parts).strip()
             return full_text if len(full_text) >= 50 else None
@@ -128,6 +287,10 @@ def pdf_text_to_markdown(text: str, url: str) -> str:
         line = line.strip()
         if not line:
             md_lines.append("")
+        elif line.startswith("|"):
+            # v2.5.0: Markdown-Tabellenzeilen aus _pdf_page_to_markdown()
+            # unverändert durchreichen (sonst macht isupper() daraus Headings)
+            md_lines.append(line)
         elif line.isupper() and len(line) < 100:
             md_lines.append(f"\n## {line.title()}\n")
         else:
@@ -260,7 +423,7 @@ def needs_javascript(html: str) -> bool:
 
 
 # =============================================================================
-# HTML → MARKDOWN: BS4 FALLBACK (v2.3.0: relative links + colspan fix)
+# HTML → MARKDOWN: BS4 FALLBACK
 # =============================================================================
 
 def html_to_markdown_bs4(html: str, url: str = "") -> str:
@@ -294,12 +457,19 @@ def html_to_markdown_bs4(html: str, url: str = "") -> str:
     return markdown.strip()
 
 
+# =============================================================================
+# v2.5.0 FIX 1: TRAFILATURA TABELLEN-WÄCHTER
+# Trafilatura-Output wird nur akzeptiert wenn:
+#   a) keine Tabellen verloren gingen (HTML hat <table>, Markdown hat Separator)
+#   b) die Zahlen-Dichte nicht um mehr als 50% eingebrochen ist
+# Sonst: BS4-Fallback (verlustfrei, aber weniger sauber).
+# v2.5.1: Tabellen-Zählung via _count_md_tables() (Regex) statt "| ---" —
+# erkennt alle Separator-Varianten, kein falscher Fallback mehr.
+# =============================================================================
+
 def html_to_markdown(html: str, url: str = "") -> str:
-    """
-    v2.3.0: Trafilatura Hybrid-Weiche.
-    Trafilatura für saubere Texte (70-80% der Fälle),
-    BS4 als sicheres Fallback wenn Trafilatura zu wenig extrahiert.
-    """
+    html_table_count = len(re.findall(r"<table[\s>]", html, re.I))
+
     try:
         traf_markdown = trafilatura.extract(
             html,
@@ -312,8 +482,26 @@ def html_to_markdown(html: str, url: str = "") -> str:
         if traf_markdown:
             word_count = len(traf_markdown.split())
             if word_count >= 40:
-                logger.info(f"⚡ Trafilatura erfolgreich: {url} ({word_count} Wörter)")
-                return re.sub(r"\n{3,}", "\n\n", traf_markdown).strip()
+
+                # Check a: Tabellen-Verlust (v2.5.1: Regex-Zählung)
+                md_table_count = _count_md_tables(traf_markdown)
+                if html_table_count > 0 and md_table_count == 0:
+                    logger.info(
+                        f"📊 Tabellen-Wächter: {html_table_count} Tabelle(n) im HTML, "
+                        f"0 im Trafilatura-Output → BS4 Fallback: {url}"
+                    )
+                else:
+                    # Check b: Zahlen-Verlust
+                    html_numbers = _html_content_numbers(html)
+                    md_numbers = _count_numbers(traf_markdown)
+                    if html_numbers > 10 and md_numbers < html_numbers * 0.5:
+                        logger.info(
+                            f"🔢 Zahlen-Wächter: {html_numbers} Zahlen im HTML, "
+                            f"nur {md_numbers} im Trafilatura-Output → BS4 Fallback: {url}"
+                        )
+                    else:
+                        logger.info(f"⚡ Trafilatura erfolgreich: {url} ({word_count} Wörter)")
+                        return re.sub(r"\n{3,}", "\n\n", traf_markdown).strip()
 
     except Exception as e:
         logger.warning(f"⚠️ Trafilatura Fehler für {url}: {str(e)}")
@@ -397,38 +585,120 @@ def _convert_element(element, lines: list, depth: int = 0, url: str = ""):
         _convert_element(child, lines, depth + 1, url=url)
 
 
+# =============================================================================
+# v2.5.0 FIX 3: ROBUSTER BS4-TABELLEN-KONVERTER
+#   - rowspan + colspan werden korrekt über Zeilen/Spalten aufgefüllt
+#   - <br> und Mehrzeiligkeit in Zellen zerstören die Tabelle nicht mehr
+#   - Header via <th> erkannt; synthetischer Header wenn keiner existiert
+#     (Markdown verlangt eine Header-Zeile — ohne diese würde die erste
+#      Datenzeile fälschlich als Header interpretiert)
+#   - alle Zeilen auf einheitliche Spaltenbreite gepolstert
+# =============================================================================
+
+def _cell_text(cell) -> str:
+    """Zellentext extrahieren ohne die Markdown-Tabelle zu zerstören."""
+    for br in cell.find_all("br"):
+        br.replace_with(" ")
+    text = cell.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+    return text.replace("|", "\\|")
+
+
+def _safe_int(value, default: int = 1) -> int:
+    try:
+        n = int(value)
+        return n if 1 <= n <= 50 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _convert_table(table_element) -> str:
     all_rows = table_element.find_all("tr")
     if not all_rows:
         return ""
 
-    markdown_rows = []
-    separator_added = False
+    # pending: Spaltenindex → (verbleibende Zeilen, Text) für aktive rowspans
+    pending = {}
+    grid = []        # Liste von Zell-Listen
+    header_flags = []  # pro Zeile: enthält <th>?
 
-    for row_idx, row in enumerate(all_rows):
+    def take_pending(col_idx: int) -> str:
+        remaining, text = pending[col_idx]
+        if remaining > 1:
+            pending[col_idx] = (remaining - 1, text)
+        else:
+            del pending[col_idx]
+        return text
+
+    for row in all_rows:
         cells = row.find_all(["th", "td"])
-        if not cells:
+        if not cells and not pending:
             continue
 
-        cell_texts = []
+        row_data = []
+        col = 0
+
         for cell in cells:
-            text = cell.get_text(" ", strip=True).replace("|", "\\|")
-            colspan = int(cell.get("colspan", 1))
-            cell_texts.extend([text] * colspan)
+            # Spalten überspringen, die von rowspans darüber belegt sind
+            while col in pending:
+                row_data.append(take_pending(col))
+                col += 1
 
-        row_str = "| " + " | ".join(cell_texts) + " |"
-        markdown_rows.append(row_str)
+            text = _cell_text(cell)
+            colspan = _safe_int(cell.get("colspan"))
+            rowspan = _safe_int(cell.get("rowspan"))
 
-        if row_idx == 0 and not separator_added:
-            separator = "| " + " | ".join(["---"] * len(cell_texts)) + " |"
-            markdown_rows.append(separator)
-            separator_added = True
+            for _ in range(colspan):
+                row_data.append(text)
+                if rowspan > 1:
+                    pending[col] = (rowspan - 1, text)
+                col += 1
 
-    return "\n".join(markdown_rows) if markdown_rows else ""
+        # rowspans rechts der letzten Zelle dieser Zeile auffüllen
+        while pending and col <= max(pending.keys()):
+            if col in pending:
+                row_data.append(take_pending(col))
+            else:
+                row_data.append("")
+            col += 1
+
+        if row_data:
+            grid.append(row_data)
+            header_flags.append(row.find("th") is not None)
+
+    if not grid:
+        return ""
+
+    # Einheitliche Spaltenbreite
+    width = max(len(r) for r in grid)
+    grid = [r + [""] * (width - len(r)) for r in grid]
+
+    # Header-Erkennung: erste Zeile mit <th> ist Header.
+    # Hat keine Zeile <th>, wird ein synthetischer (leerer) Header eingefügt,
+    # damit die erste Datenzeile nicht als Header verloren geht.
+    markdown_rows = []
+    separator = "| " + " | ".join(["---"] * width) + " |"
+
+    if header_flags[0]:
+        markdown_rows.append("| " + " | ".join(grid[0]) + " |")
+        markdown_rows.append(separator)
+        data_rows = grid[1:]
+    else:
+        markdown_rows.append("| " + " | ".join([" "] * width) + " |")
+        markdown_rows.append(separator)
+        data_rows = grid
+
+    for r in data_rows:
+        markdown_rows.append("| " + " | ".join(r) + " |")
+
+    return "\n".join(markdown_rows)
 
 
 # =============================================================================
 # QUALITY SCORING
+# v2.5.1: Tabellen-Zählung via _count_md_tables() — konsistent mit dem
+# Tabellen-Wächter. Trafilatura-Tabellen wurden vorher nicht gezählt
+# (Separator-Format) → Score war um bis zu 2 Punkte zu niedrig.
 # =============================================================================
 
 def calculate_quality_score(markdown: str) -> dict:
@@ -455,7 +725,7 @@ def calculate_quality_score(markdown: str) -> dict:
     if currency_pattern:
         score += 1
 
-    table_count = markdown.count("| ---")
+    table_count = _count_md_tables(markdown)  # v2.5.1
     details["tables_found"] = table_count
     if table_count > 0:
         score += 2
@@ -587,7 +857,10 @@ class BatchRequest(BaseModel):
 @router.post("/fetch-markdown-batch")
 async def fetch_markdown_batch(request: BatchRequest):
     """
-    BATCH ENDPOINT – bis zu 15 URLs parallel
+    BATCH ENDPOINT – bis zu 20 URLs parallel
+    v2.5.1: Batch Limit 15 → 20 (passend zu WF2 limit=20), Tabellen-Zählung
+            via Regex, PDF-Bild-Blöcke gefiltert
+    v2.5.0: Tabellen-Wächter, PDF-Tabellenextraktion, robuster Tabellen-Konverter
     v2.4.1: clean_text() jetzt auch in allen Fehler-Returns
     v2.4.0: Null-Byte Fix via clean_text() in fetch_and_convert()
     v2.3.0: Trafilatura Hybrid + Relative Links Fix + Colspan Fix
@@ -595,7 +868,9 @@ async def fetch_markdown_batch(request: BatchRequest):
     if not request.urls:
         raise HTTPException(status_code=400, detail="urls list is required")
 
-    urls = request.urls[:15]
+    # v2.5.1: 15 → 20, passend zu WF2 "Get Pending URLs" (limit=20).
+    # Semaphore(8) begrenzt weiterhin die echte Parallelität.
+    urls = request.urls[:20]
     logger.info(f"🚀 Batch fetch started: {len(urls)} URLs")
 
     semaphore = asyncio.Semaphore(8)

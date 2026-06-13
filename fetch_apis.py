@@ -13,6 +13,17 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
+v4.0.1 – 2026-06-13
+  FIX 1 (Daten-Erhalt): Fehlgeschlagene Fetches (None / Exception / fehlgeschlagene
+         Transformation) überschreiben vorhandene Werte NICHT mehr mit null.
+         Das betroffene Feld wird einfach aus dem Upsert weggelassen — der zuletzt
+         erfolgreich geholte Wert in smart_country_data bleibt erhalten.
+         Vorher: ein kurzer API-Ausfall setzte gute Bestandsdaten auf null zurück
+         und der trg_update_completeness-Trigger zählte die Completeness runter.
+  FIX 2 (Fallback-Kurse): NOK und DKK zu EXCHANGE_RATES_TO_USD ergänzt. Vorher
+         fielen sie bei Ausfall der Live-Wechselkurs-API auf Rate 1.0 zurück
+         (≈10× zu hoch). Greift nur im Fallback-Pfad, aber jetzt korrekt.
+
 v4.0.0 – 2026-06-06
   ÄNDERUNG: Schreibt jetzt direkt in smart_country_data statt data_group_b_finanzen
   ÄNDERUNG: Interne Felder (rule_id, source_url, url_id, extraction_quality,
@@ -62,6 +73,7 @@ INTERNAL_FIELDS = {
 # =============================================================================
 # WÄHRUNGS-BASISWERTE (Fallback falls ExchangeRate-API nicht erreichbar)
 # Werden beim Start aktualisiert via fetch_exchange_rates()
+# v4.0.1: NOK + DKK ergänzt (waren in currency_map, fehlten aber hier → Rate 1.0)
 # =============================================================================
 
 EXCHANGE_RATES_TO_USD = {
@@ -75,6 +87,8 @@ EXCHANGE_RATES_TO_USD = {
     "RUB": 0.011,
     "SAR": 0.267,
     "AED": 0.272,
+    "NOK": 0.094,
+    "DKK": 0.145,
     "USD": 1.0,
 }
 
@@ -565,26 +579,23 @@ async def process_country(
     }
 
     fields_written = 0
-    fields_null = 0
+    fields_skipped = 0
 
     for rule, raw_value in zip(relevant_rules, raw_values):
         db_field     = rule["db_field"]
         source_field = db_field + "_source"
         date_field   = db_field + "_date"
 
+        # v4.0.1 FIX 1: Bei Exception / None / fehlgeschlagener Transformation
+        # das Feld NICHT in den Upsert aufnehmen → vorhandener Wert bleibt erhalten.
         if isinstance(raw_value, Exception):
-            logger.warning(f"⚠️ Exception für {rule['api_id']}: {raw_value}")
-            upsert_data[db_field]     = None
-            upsert_data[source_field] = None
-            upsert_data[date_field]   = None
-            fields_null += 1
+            logger.warning(f"⚠️ Exception für {rule['api_id']}: {raw_value} — Feld {db_field} übersprungen (Altwert bleibt)")
+            fields_skipped += 1
             continue
 
         if raw_value is None:
-            upsert_data[db_field]     = None
-            upsert_data[source_field] = None
-            upsert_data[date_field]   = None
-            fields_null += 1
+            logger.info(f"⏭️ Kein Wert für {db_field} — übersprungen (Altwert bleibt)")
+            fields_skipped += 1
             continue
 
         currency = get_currency_for_rule(rule, country)
@@ -610,10 +621,22 @@ async def process_country(
                 f"(raw: {raw_value}, provider: {rule['provider']})"
             )
         else:
-            upsert_data[db_field]     = None
-            upsert_data[source_field] = None
-            upsert_data[date_field]   = None
-            fields_null += 1
+            # Transformation fehlgeschlagen — Altwert ebenfalls erhalten
+            logger.warning(f"⚠️ Transformation lieferte None für {db_field} — übersprungen (Altwert bleibt)")
+            fields_skipped += 1
+
+    # v4.0.1: Wenn außer den Schlüsselfeldern nichts Neues da ist, Upsert überspringen —
+    # sonst würde ein leerer Upsert nur updated_at/Trigger anstoßen ohne Datengewinn.
+    data_fields = [k for k in upsert_data if k not in ("country_code", "country_name")]
+    if not data_fields:
+        logger.info(f"⏭️ {country_name}: keine neuen Werte — Upsert übersprungen, Bestand unverändert")
+        return {
+            "country_code": country_code,
+            "country_name": country_name,
+            "success": True,
+            "fields_written": 0,
+            "fields_skipped": fields_skipped,
+        }
 
     # Interne Felder herausfiltern bevor Upsert nach smart_country_data
     smart_data = {k: v for k, v in upsert_data.items() if k not in INTERNAL_FIELDS}
@@ -626,14 +649,14 @@ async def process_country(
 
         logger.info(
             f"✅ {country_name}: {fields_written} Felder geschrieben, "
-            f"{fields_null} null → smart_country_data"
+            f"{fields_skipped} übersprungen (Altwert erhalten) → smart_country_data"
         )
         return {
             "country_code": country_code,
             "country_name": country_name,
             "success": True,
             "fields_written": fields_written,
-            "fields_null": fields_null,
+            "fields_skipped": fields_skipped,
         }
 
     except Exception as e:
@@ -747,13 +770,13 @@ async def fetch_apis(request: FetchApisRequest):
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.0: {successful}/{len(results)} Länder, "
+        f"🏁 fetch-apis v4.0.1: {successful}/{len(results)} Länder, "
         f"{total_fields} Felder total → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.0.0",
+        "version": "4.0.1",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

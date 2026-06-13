@@ -9,56 +9,43 @@ v2.1.0 - Multilingual Fix
 v2.2.0 - Dynamic Keywords
 v2.3.0 - Smarter JS Detection
 v2.3.1 - BUEROKRATIE Fix: Umlaut aus target_group entfernt (Encoding-Kompatibilität)
-         GROUP F: BÜROKRATIE → GROUP F: BUEROKRATIE in allen Fallback-Maps
 v2.4.0 - Status Fix: Neue URLs bekommen status='discovered' statt 'pending'
-         damit WF1b sauber filtern kann und kein Endlosloop entsteht
 v2.5.0 - PDF Discovery Fix: /pdf/, /download/, .doc, .xls aus BLOCKED_PATH_PATTERNS entfernt
-         damit Gebührentabellen und offizielle Dokumente gecrawlt werden
-v2.6.0 - Chunked Protection Fix: URLs mit status='chunked' werden beim upsert nicht
-         überschrieben — nur neue URLs werden eingefügt, chunked URLs bleiben unangetastet
+v2.6.0 - Chunked Protection Fix: URLs mit status='chunked' werden beim upsert nicht überschrieben
 v2.7.0 - Parallelisierung: Rules werden parallel verarbeitet (max MAX_PARALLEL_RULES gleichzeitig)
-         CONCURRENT_LIMIT pro Rule reduziert damit der Server nicht crasht
-v2.7.1 - Domain Block Detection: Fehlerzähler pro Domain — nach DOMAIN_FAIL_THRESHOLD
-         gescheiterten URLs wird die Domain für den Rest des Crawls übersprungen.
-         Zähler wird nur beim letzten fehlgeschlagenen Versuch erhöht (nicht pro Retry).
-v2.8.0 - Scoring komplett entfernt: score_url(), extract_topics(), GROUP_KEYWORDS,
-         GENERAL_KEYWORDS, load_keywords(), config_keywords-Abfrage — alles raus.
-         Embedding in WF6 übernimmt die Relevanzbeurteilung, kein Vorfilter mehr nötig.
-         Alle gecrawlten URLs landen in discovered_urls, nur BLOCKED_PATH_PATTERNS filtert.
-         Target URL garantiert gecrawlt: is_main_url=True, überspringt Domain-Block-Check.
-         is_main_url wird jetzt korrekt in Supabase gespeichert.
-v2.9.0 - Same-Day Protection: Rules die heute bereits gecrawlt wurden (last_crawled_at
-         >= Tagesbeginn UTC) werden übersprungen. Kein doppeltes Crawlen am selben Tag.
-         Erneutes Crawlen am nächsten Tag oder später ist weiterhin möglich.
-         Nie gecrawlte Rules (last_crawled_at IS NULL) werden immer verarbeitet.
-v3.0.0 - Job-System: /discover startet Job im Hintergrund und gibt sofort job_id zurück.
-         Kein Timeout mehr in n8n möglich — Job läuft unabhängig von der HTTP-Verbindung.
-         Neuer Endpoint GET /discover/status/{job_id} gibt aktuellen Fortschritt zurück.
-         n8n pollt /discover/status/{job_id} bis status='completed'.
-         Job-Speicher im RAM (dict) — wird bei Server-Neustart geleert, jobs laufen weiter.
-v3.1.0 - NULL-first Sortierung: Rules werden aus Supabase sortiert abgerufen.
-         Erst alle nie gecrawlten Rules (last_crawled_at IS NULL), dann nach Timestamp
-         aufsteigend (älteste zuerst). Dadurch vorhersehbare, in Supabase nachvollziehbare
-         Reihenfolge — neue Rules werden garantiert als erstes abgearbeitet.
-v3.3.0 - Pagination Fix: Supabase liefert standardmäßig max. 1000 Rows. Bei 1276 aktiven
-         Rules wurden die 214 NULL-Rules (Position 1001-1276) nie geliefert. Neue Funktion
-         fetch_all_rules() holt alle Rules via .range()-Pagination in 1000er-Batches.
-         Sortierung jetzt direkt in DB via .order('last_crawled_at', nullsfirst=True) —
-         kein Python-Sort mehr nötig. NULL-Rules kommen garantiert in jedem Run an.
+v2.7.1 - Domain Block Detection: Fehlerzähler pro Domain
+v2.8.0 - Scoring komplett entfernt: Embedding in WF6 übernimmt die Relevanzbeurteilung
+v2.9.0 - Same-Day Protection: Rules die heute bereits gecrawlt wurden werden übersprungen
+v3.0.0 - Job-System: /discover startet Job im Hintergrund und gibt sofort job_id zurück
+v3.1.0 - NULL-first Sortierung
+v3.3.0 - Pagination Fix: fetch_all_rules() umgeht 1000-Row-Limit
 v3.4.0 - Trigger Fix + Timestamp Fix:
-         1. target_url nicht mehr in discovered_urls schreiben — Postgres Trigger
-            trg_config_rules_insert_discovered übernimmt das zuverlässig beim INSERT/UPDATE
-            auf config_rules. save_urls_to_supabase() speichert nur noch Sub-Links
-            (is_main_url=False). Kein doppelter Eintrag mehr möglich.
-         2. last_crawled_at nur bei Erfolg setzen (saved_count > 0) — Rules die 0
-            Sub-Links liefern bekommen keinen Timestamp und werden beim nächsten Run
-            erneut verarbeitet. Eindeutiger Zustand: Timestamp = wirklich gecrawlt.
+         1. target_url nicht mehr in discovered_urls schreiben — Postgres Trigger übernimmt das
+         2. last_crawled_at nur bei Erfolg setzen (saved_count > 0)
+v3.5.0 - Sieben Robustheits-Fixes (kein Schema-Eingriff):
+         (3) IGNORED_QUERY_PARAMS: page/p/lang/language/locale ENTFERNT — Pagination und
+             Sprachvarianten kollabierten vorher auf eine URL; ganze Sprachversionen gingen verloren.
+         (9) normalize_url() lowercased jetzt Scheme + Host (RFC 3986) — Example.com/x und
+             example.com/x sind nicht mehr zwei verschiedene URLs.
+         (5) Per-Domain Rate-Limiting: zufällige Pause (RATE_LIMIT_MIN..MAX Sek.) zwischen
+             Requests an dieselbe Domain. Reduziert 403/429-Blocks deutlich. 429 Retry-After
+             Header wird ausgewertet (statt fixer Delays).
+         (6) Content-Type- und Größen-Check in fetch_html_fast: nur text/html wird geparst,
+             Antworten > MAX_CONTENT_BYTES werden verworfen. Kein Binär-/Riesencontent im RAM.
+         (8) Playwright Race-Condition behoben: asyncio.Lock um Browser-Initialisierung,
+             page.close() in finally (kein Page-Leak bei Exceptions).
+         (7) Bereits gechunkte URLs werden VOR dem Crawl aus der Frontier gefiltert
+             (chunked_skip-Set) — spart Bandbreite, Seiten werden nicht erneut geholt.
+         (4) robots.txt wird gelesen — NUR um zusätzliche Sitemap:-Einträge zu finden
+             (mehr echte URLs). Disallow-Regeln werden bewusst NICHT als Sperre genutzt;
+             Filterung läuft weiter ausschließlich über BLOCKED_PATH_PATTERNS.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
+import random
 from collections import deque
 import httpx
 import tldextract
@@ -67,7 +54,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 from supabase import create_client, Client
 import os
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Set
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -82,7 +69,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.4.0"  # v3.4.0: Trigger Fix + Timestamp Fix
+    version="3.5.0"
 )
 
 app.add_middleware(
@@ -126,10 +113,20 @@ MAX_RETRIES = 2
 RETRY_DELAYS = [1, 3]
 DOMAIN_FAIL_THRESHOLD = 3
 
+# v3.5.0 (5): Höflichkeits-Intervall pro Domain (Sekunden, zufällig).
+RATE_LIMIT_MIN = 1.0
+RATE_LIMIT_MAX = 3.0
+# v3.5.0 (5): Obergrenze für Retry-After, damit ein bösartiger Header den Crawl nicht einfriert.
+MAX_RETRY_AFTER = 30.0
+# v3.5.0 (6): Antworten größer als das werden verworfen (kein Binär-/Riesencontent).
+MAX_CONTENT_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# v3.5.0 (3): page/p/lang/language/locale ENTFERNT.
+# Diese Parameter unterscheiden echte Seiten (Pagination, Sprachversionen) —
+# sie zu strippen kollabierte ganze Sprachversionen und Listenseiten auf eine URL.
 IGNORED_QUERY_PARAMS = [
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "ref", "source", "session", "sid",
-    "page", "p", "lang", "language", "locale",
 ]
 
 BLOCKED_PATH_PATTERNS = [
@@ -152,6 +149,38 @@ BLOCKED_PATH_PATTERNS = [
 ]
 
 # =============================================================================
+# v3.5.0 (5): PER-DOMAIN RATE LIMITER
+# Stellt sicher, dass an dieselbe Domain nicht zwei Requests gleichzeitig oder
+# zu schnell hintereinander gehen. Pause ist zufällig (menschlicheres Muster,
+# geringere Blockrate). Jede Domain hat ihr eigenes Lock + letzten Zeitstempel.
+# =============================================================================
+
+class DomainRateLimiter:
+    def __init__(self, min_delay: float, max_delay: float):
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._last_request: Dict[str, float] = {}
+
+    def _get_lock(self, domain: str) -> asyncio.Lock:
+        if domain not in self._locks:
+            self._locks[domain] = asyncio.Lock()
+        return self._locks[domain]
+
+    async def wait(self, domain: str):
+        lock = self._get_lock(domain)
+        async with lock:
+            loop = asyncio.get_event_loop()
+            now = loop.time()
+            last = self._last_request.get(domain, 0.0)
+            delay = random.uniform(self.min_delay, self.max_delay)
+            elapsed = now - last
+            if elapsed < delay:
+                await asyncio.sleep(delay - elapsed)
+            self._last_request[domain] = asyncio.get_event_loop().time()
+
+
+# =============================================================================
 # HELPER FUNCTIONS
 # =============================================================================
 
@@ -164,7 +193,13 @@ def normalize_url(url: str) -> str:
     else:
         clean_query = ""
     path = parsed.path.rstrip("/") if parsed.path != "/" else "/"
-    normalized = parsed._replace(fragment="", query=clean_query, path=path).geturl()
+    # v3.5.0 (9): Scheme + Host case-insensitiv (RFC 3986) — verhindert Duplikate
+    # wie Example.com/x vs example.com/x. Pfad/Query bleiben case-sensitiv.
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    normalized = parsed._replace(
+        scheme=scheme, netloc=netloc, fragment="", query=clean_query, path=path
+    ).geturl()
     return normalized
 
 
@@ -216,10 +251,6 @@ def get_today_start_utc() -> str:
 # =============================================================================
 
 def fetch_all_rules(base_query) -> List[Dict]:
-    """
-    Holt alle aktiven Rules via Pagination — umgeht das 1000-Row-Limit von Supabase.
-    Sortierung: NULL zuerst (nie gecrawlte Rules), dann älteste Timestamps aufsteigend.
-    """
     all_rules = []
     page_size = 1000
     offset = 0
@@ -245,27 +276,87 @@ def fetch_all_rules(base_query) -> List[Dict]:
 
 
 # =============================================================================
-# SITEMAP PARSER
+# v3.5.0 (7): CHUNKED-URL VORFILTER
+# Holt vorab alle URLs einer Domain, die bereits status='chunked' haben, damit
+# sie gar nicht erst gecrawlt werden (statt erst beim Speichern auszusortieren).
 # =============================================================================
 
-async def fetch_sitemap_urls(base_url: str) -> List[str]:
-    sitemap_url = urljoin(base_url, "/sitemap.xml")
-    urls = []
+def fetch_chunked_urls_for_domain(base_domain: str) -> Set[str]:
+    chunked: Set[str] = set()
+    try:
+        page_size = 1000
+        offset = 0
+        while True:
+            resp = (
+                supabase.table("discovered_urls")
+                .select("url")
+                .eq("status", "chunked")
+                .ilike("url", f"%{base_domain}%")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+            batch = resp.data or []
+            if not batch:
+                break
+            for row in batch:
+                chunked.add(normalize_url(row["url"]))
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        if chunked:
+            logger.info(f"🔒 {len(chunked)} bereits gechunkte URLs werden übersprungen ({base_domain})")
+    except Exception as e:
+        logger.warning(f"⚠️ Chunked-Vorfilter fehlgeschlagen für {base_domain}: {str(e)}")
+    return chunked
+
+
+# =============================================================================
+# SITEMAP PARSER
+# v3.5.0 (4): robots.txt wird gelesen, um zusätzliche Sitemap:-Einträge zu finden.
+# Disallow-Regeln werden NICHT ausgewertet.
+# =============================================================================
+
+async def fetch_robots_sitemaps(base_url: str) -> List[str]:
+    """Liest NUR die Sitemap:-Zeilen aus robots.txt. Disallow wird ignoriert."""
+    robots_url = urljoin(base_url, "/robots.txt")
+    sitemaps: List[str] = []
     try:
         client = await get_http_client()
-        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.0)"})
+        r = await client.get(robots_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.5)"})
+        if r.status_code != 200:
+            return []
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line.lower().startswith("sitemap:"):
+                sm = line.split(":", 1)[1].strip()
+                if sm.startswith("http"):
+                    sitemaps.append(sm)
+        if sitemaps:
+            logger.info(f"🤖 robots.txt: {len(sitemaps)} Sitemap-Einträge gefunden")
+    except Exception as e:
+        logger.info(f"🤖 robots.txt nicht verfügbar: {str(e)}")
+    return sitemaps
+
+
+async def _parse_sitemap_url(client, sitemap_url: str) -> List[str]:
+    """Parst eine einzelne Sitemap-URL (inkl. Sitemap-Index, max 5 Sub-Sitemaps)."""
+    urls: List[str] = []
+    try:
+        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.5)"})
         if r.status_code != 200:
             return []
         root = ET.fromstring(r.text)
         ns = ""
         if root.tag.startswith("{"):
             ns = root.tag.split("}")[0] + "}"
-        sitemaps = root.findall(f".//{ns}sitemap/{ns}loc")
-        if sitemaps:
-            for sitemap_loc in sitemaps[:5]:
+        sub_sitemaps = root.findall(f".//{ns}sitemap/{ns}loc")
+        if sub_sitemaps:
+            for sitemap_loc in sub_sitemaps[:5]:
+                if not sitemap_loc.text:
+                    continue
                 sub_url = sitemap_loc.text.strip()
                 try:
-                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.0)"})
+                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.5)"})
                     if sub_r.status_code == 200:
                         sub_root = ET.fromstring(sub_r.text)
                         sub_ns = ""
@@ -280,10 +371,35 @@ async def fetch_sitemap_urls(base_url: str) -> List[str]:
             for loc in root.findall(f".//{ns}loc"):
                 if loc.text:
                     urls.append(loc.text.strip())
-        logger.info(f"📋 Sitemap: {len(urls)} URLs gefunden")
     except Exception as e:
-        logger.info(f"📋 Sitemap nicht verfügbar: {str(e)}")
+        logger.info(f"📋 Sitemap nicht parsebar ({sitemap_url}): {str(e)}")
     return urls
+
+
+async def fetch_sitemap_urls(base_url: str) -> List[str]:
+    """
+    Sammelt URLs aus /sitemap.xml UND aus allen in robots.txt gelisteten Sitemaps.
+    v3.5.0 (4): robots.txt-Sitemaps ergänzen die Standard-Sitemap.
+    """
+    client = await get_http_client()
+    all_urls: List[str] = []
+    seen_sitemaps: Set[str] = set()
+
+    # 1. Standard /sitemap.xml
+    default_sitemap = urljoin(base_url, "/sitemap.xml")
+    seen_sitemaps.add(default_sitemap)
+    all_urls.extend(await _parse_sitemap_url(client, default_sitemap))
+
+    # 2. Zusätzliche Sitemaps aus robots.txt
+    for sm in await fetch_robots_sitemaps(base_url):
+        if sm not in seen_sitemaps:
+            seen_sitemaps.add(sm)
+            all_urls.extend(await _parse_sitemap_url(client, sm))
+
+    # Dedupe unter Beibehaltung der Reihenfolge
+    deduped = list(dict.fromkeys(all_urls))
+    logger.info(f"📋 Sitemap(s): {len(deduped)} URLs gesamt (aus {len(seen_sitemaps)} Sitemap-Quellen)")
+    return deduped
 
 
 # =============================================================================
@@ -314,18 +430,72 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-async def fetch_html_fast(url: str, domain_fails: Dict[str, int], is_target: bool = False) -> Optional[str]:
+def _parse_retry_after(value: str) -> Optional[float]:
+    """Retry-After kann Sekunden (int) oder ein HTTP-Datum sein. Gedeckelt auf MAX_RETRY_AFTER."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        secs = float(value)
+        return max(0.0, min(secs, MAX_RETRY_AFTER))
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = (dt - datetime.now(timezone.utc)).total_seconds()
+            return max(0.0, min(delta, MAX_RETRY_AFTER))
+    except Exception:
+        pass
+    return None
+
+
+async def fetch_html_fast(
+    url: str,
+    domain_fails: Dict[str, int],
+    rate_limiter: "DomainRateLimiter",
+    is_target: bool = False,
+) -> Optional[str]:
     domain = get_domain(url)
     if not is_target and domain_fails.get(domain, 0) >= DOMAIN_FAIL_THRESHOLD:
         logger.info(f"⛔ Domain geblockt, skip: {domain} ({url})")
         return None
     client = await get_http_client()
     for attempt in range(MAX_RETRIES):
+        # v3.5.0 (5): Höflichkeits-Pause pro Domain vor jedem Request
+        await rate_limiter.wait(domain)
         try:
             r = await client.get(url)
             if r.status_code == 200:
+                # v3.5.0 (6): Content-Type prüfen — nur HTML weiterverarbeiten
+                content_type = r.headers.get("content-type", "").lower()
+                if content_type and "html" not in content_type and "xml" not in content_type:
+                    logger.info(f"⏭️ Kein HTML ({content_type.split(';')[0]}), skip: {url}")
+                    return None
+                # v3.5.0 (6): Größen-Check — Riesencontent nicht in den RAM laden
+                content_length = r.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_CONTENT_BYTES:
+                            logger.info(f"⏭️ Content zu groß ({content_length} bytes), skip: {url}")
+                            return None
+                    except ValueError:
+                        pass
+                if len(r.content) > MAX_CONTENT_BYTES:
+                    logger.info(f"⏭️ Content zu groß ({len(r.content)} bytes), skip: {url}")
+                    return None
                 return r.text
             elif r.status_code in (403, 429):
+                # v3.5.0 (5): Bei 429 Retry-After respektieren (gedeckelt)
+                if r.status_code == 429 and attempt < MAX_RETRIES - 1:
+                    retry_after = _parse_retry_after(r.headers.get("retry-after", ""))
+                    delay = retry_after if retry_after is not None else RETRY_DELAYS[attempt]
+                    logger.info(f"🔄 429 Retry-After {delay:.1f}s für {url}")
+                    await asyncio.sleep(delay)
+                    continue
                 if not is_target:
                     domain_fails[domain] = domain_fails.get(domain, 0) + 1
                     logger.warning(f"⚠️ Domain Fehler {domain_fails[domain]}/{DOMAIN_FAIL_THRESHOLD}: {domain} (Status {r.status_code})")
@@ -364,15 +534,22 @@ async def fetch_html_fast(url: str, domain_fails: Dict[str, int], is_target: boo
 
 
 async def fetch_html_playwright(url: str, browser) -> Optional[str]:
+    # v3.5.0 (8): page.close() in finally — kein Page-Leak bei Exceptions
+    page = None
     try:
         page = await browser.new_page()
         await page.goto(url, timeout=30000, wait_until="domcontentloaded")
         html = await page.content()
-        await page.close()
         return html
     except Exception as e:
         logger.warning(f"⚠️ Playwright Fehler für {url}: {str(e)}")
         return None
+    finally:
+        if page is not None:
+            try:
+                await page.close()
+            except Exception:
+                pass
 
 
 def needs_javascript(html: str) -> bool:
@@ -406,8 +583,15 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
     playwright_instance = None
     playwright_browser = None
+    # v3.5.0 (8): Lock um die Browser-Initialisierung (Race-Condition bei parallelen Tasks)
+    playwright_lock = asyncio.Lock()
     domain_fails: Dict[str, int] = {}
+    # v3.5.0 (5): ein Rate-Limiter pro Rule (deckt Haupt- + Sub-Domains ab)
+    rate_limiter = DomainRateLimiter(RATE_LIMIT_MIN, RATE_LIMIT_MAX)
     normalized_start = normalize_url(start_url)
+
+    # v3.5.0 (7): bereits gechunkte URLs vorab laden — werden nicht erneut gecrawlt
+    chunked_skip = fetch_chunked_urls_for_domain(base_domain)
 
     logger.info(f"🚀 Starting discovery for: {rule['country_name']} ({rule['rule_id']})")
     logger.info(f"📊 Max URLs: {max_pages}, Max Depth: {max_depth}")
@@ -424,6 +608,8 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
     for sm_url in sitemap_filtered[:max_pages]:
         normalized_sm = normalize_url(sm_url)
+        if normalized_sm in chunked_skip:
+            continue
         if normalized_sm not in to_visit_set:
             to_visit.append((normalized_sm, 0, False))
             to_visit_set.add(normalized_sm)
@@ -438,7 +624,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             url_lower = url.lower()
             is_pdf = url_lower.endswith(".pdf") or ".pdf?" in url_lower
             if is_pdf:
-                # v3.4.0: target_url (is_main_url=True) wird vom Trigger geschrieben — hier überspringen
                 if is_target:
                     return url, depth, is_target, None, []
                 return url, depth, is_target, {
@@ -452,7 +637,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     "target_group": rule['target_group']
                 }, []
 
-            html = await fetch_html_fast(url, domain_fails, is_target=is_target)
+            html = await fetch_html_fast(url, domain_fails, rate_limiter, is_target=is_target)
             needs_pw = html and needs_javascript(html)
 
             if html and not needs_pw:
@@ -466,16 +651,18 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     logger.info(f"🔄 0 interne Links, nutze Playwright: {url}")
 
             if needs_pw:
+                # v3.5.0 (8): Lock verhindert doppelte Browser-Initialisierung
                 if not playwright_browser:
-                    playwright_instance = await async_playwright().start()
-                    playwright_browser = await playwright_instance.chromium.launch(
-                        headless=True,
-                        args=['--no-sandbox', '--disable-dev-shm-usage']
-                    )
+                    async with playwright_lock:
+                        if not playwright_browser:
+                            playwright_instance = await async_playwright().start()
+                            playwright_browser = await playwright_instance.chromium.launch(
+                                headless=True,
+                                args=['--no-sandbox', '--disable-dev-shm-usage']
+                            )
                 html = await fetch_html_playwright(url, playwright_browser)
 
             if not html:
-                # v3.4.0: target_url wird vom Trigger geschrieben — kein Fallback-Eintrag nötig
                 return url, depth, is_target, None, []
 
             soup = BeautifulSoup(html, "html.parser")
@@ -495,9 +682,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                     if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
                         child_links.append(normalized_full)
 
-            # v3.4.0: target_url (is_main_url=True) nicht in discovered_urls schreiben —
-            # Postgres Trigger trg_config_rules_insert_discovered übernimmt das.
-            # Nur Sub-Links (is_main_url=False) werden gespeichert.
             if is_target:
                 return url, depth, is_target, None, child_links
 
@@ -521,6 +705,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             normalized = normalize_url(url)
             if normalized in visited or depth > max_depth:
                 continue
+            # v3.5.0 (7): gechunkte URLs überspringen (außer Target)
+            if not is_target and normalized in chunked_skip:
+                continue
             visited.add(normalized)
             batch.append((normalized, depth, is_target))
 
@@ -539,7 +726,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             if url_data:
                 discovered_urls.append(url_data)
             for link in child_links:
-                if link not in visited and link not in to_visit_set and len(visited) + len(to_visit) < max_pages * 2:
+                if (link not in visited and link not in to_visit_set
+                        and link not in chunked_skip
+                        and len(visited) + len(to_visit) < max_pages * 2):
                     to_visit.append((link, depth + 1, False))
                     to_visit_set.add(link)
 
@@ -557,11 +746,6 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 # =============================================================================
 
 def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
-    """
-    v3.4.0: Speichert nur Sub-Links (is_main_url=False).
-    target_urls werden vom Postgres Trigger trg_config_rules_insert_discovered
-    automatisch in discovered_urls eingetragen — kein doppelter Eintrag.
-    """
     if not discovered_urls:
         return 0
 
@@ -571,7 +755,6 @@ def save_urls_to_supabase(discovered_urls: List[Dict]) -> int:
     duplicates_removed = 0
 
     for url_data in discovered_urls:
-        # v3.4.0: Sicherheitscheck — target_urls (is_main_url=True) nie schreiben
         if url_data.get("is_main_url", False):
             continue
         url = url_data["url"]
@@ -631,11 +814,6 @@ def update_last_crawled(rule_id: str):
 # =============================================================================
 
 async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: Optional[int]):
-    """
-    Verarbeitet alle Rules im Hintergrund.
-    v3.4.0: last_crawled_at wird nur gesetzt wenn saved_count > 0 —
-    eindeutiger Zustand: Timestamp bedeutet wirklich gecrawlt, nicht nur versucht.
-    """
     job = JOB_STORE[job_id]
     job["status"] = "running"
     job["total_rules"] = len(rules)
@@ -654,7 +832,6 @@ async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: O
                 discovered = await discover_urls(rule)
                 saved_count = save_urls_to_supabase(discovered)
 
-                # v3.4.0: last_crawled_at nur bei Erfolg setzen
                 if saved_count > 0:
                     update_last_crawled(rule['rule_id'])
                     logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} Sub-Links — last_crawled_at gesetzt")
@@ -754,12 +931,16 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "status": "running",
-        "changes_v3.4.0": [
-            "target_url nicht mehr in discovered_urls geschrieben — Postgres Trigger übernimmt das",
-            "last_crawled_at nur bei saved_count > 0 gesetzt — eindeutiger Erfolgszustand",
-            "0 Sub-Links = kein Timestamp = nächster Run versucht es erneut",
+        "changes_v3.5.0": [
+            "IGNORED_QUERY_PARAMS: page/p/lang/language/locale entfernt (Pagination + Sprachen erhalten)",
+            "normalize_url: Scheme + Host lowercased (keine Case-Duplikate)",
+            "Per-Domain Rate-Limiting mit Random-Delay + Retry-After-Auswertung",
+            "Content-Type- und Größen-Check in fetch_html_fast (max 5 MB, nur HTML)",
+            "Playwright Race-Condition-Lock + page.close() in finally",
+            "Gechunkte URLs werden vor dem Crawl gefiltert",
+            "robots.txt nur als Sitemap-Quelle genutzt (Disallow nicht als Sperre)",
         ]
     }
 
@@ -769,7 +950,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -778,7 +959,7 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.4.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.5.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
@@ -809,7 +990,6 @@ async def run_discovery(request: DiscoveryRequest):
             return DiscoveryJobResponse(job_id=job_id, status="completed", total_rules=0,
                                         skipped_rules=0, message="Keine aktiven Rules gefunden")
 
-        # Same-Day Protection
         today_start = get_today_start_utc()
         skipped_today = []
         rules_to_process = []
@@ -824,7 +1004,6 @@ async def run_discovery(request: DiscoveryRequest):
         if skipped_today:
             logger.info(f"⏭️ Heute bereits gecrawlt, übersprungen: {len(skipped_today)} Rules")
 
-        # GROUP B herausfiltern
         rules = [r for r in rules_to_process if not any(excluded in r.get("target_group", "") for excluded in EXCLUDED_FROM_DISCOVERY)]
         skipped_group_b = len(rules_to_process) - len(rules)
         total_skipped = len(skipped_today) + skipped_group_b
@@ -938,16 +1117,15 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.4.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.5.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
     logger.info(f"⚡ Domain fail threshold (Sub-URLs): {DOMAIN_FAIL_THRESHOLD}")
-    logger.info(f"⚡ Same-Day Protection: aktiv")
-    logger.info(f"⚡ Job-System: aktiv — /discover gibt sofort job_id zurück")
-    logger.info(f"⚡ Pagination Fix: aktiv — fetch_all_rules() umgeht 1000-Row-Limit")
-    logger.info(f"⚡ Trigger Fix: aktiv — target_url wird vom Postgres Trigger geschrieben")
-    logger.info(f"⚡ Timestamp Fix: aktiv — last_crawled_at nur bei saved_count > 0")
+    logger.info(f"⚡ Rate-Limit pro Domain: {RATE_LIMIT_MIN}-{RATE_LIMIT_MAX}s (random)")
+    logger.info(f"⚡ Max Content: {MAX_CONTENT_BYTES // (1024*1024)} MB, nur HTML")
+    logger.info(f"⚡ robots.txt: nur Sitemap-Discovery (Disallow ignoriert)")
+    logger.info(f"⚡ Chunked-Vorfilter: aktiv")
     logger.info("✅ API is ready!")
 
 

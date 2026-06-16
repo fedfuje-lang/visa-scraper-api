@@ -39,6 +39,13 @@ v3.5.0 - Sieben Robustheits-Fixes (kein Schema-Eingriff):
          (4) robots.txt wird gelesen — NUR um zusätzliche Sitemap:-Einträge zu finden
              (mehr echte URLs). Disallow-Regeln werden bewusst NICHT als Sperre genutzt;
              Filterung läuft weiter ausschließlich über BLOCKED_PATH_PATTERNS.
+v3.6.0 - crawl_attempts Fix: Rules die dauerhaft 0 URLs liefern werden nach
+         MAX_FAILED_ATTEMPTS=5 Versuchen deaktiviert (active=false).
+         Erfolgreiche Rules setzen crawl_attempts zurück auf 0.
+         Zwei neue Spalten in config_rules: crawl_attempts, last_crawl_failed_at.
+         Behebt das Dauerschleifenproblem: tote Rules (Login-Wall, Site offline,
+         dauerhaft 0 Sub-Links) bekamen nie einen Timestamp und wurden bei jedem
+         Lauf erneut versucht.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -69,7 +76,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.5.0"
+    version="3.6.0"
 )
 
 app.add_middleware(
@@ -102,6 +109,12 @@ JOB_STORE: Dict[str, Dict] = {}
 # =============================================================================
 
 EXCLUDED_FROM_DISCOVERY = ["GROUP B: FINANZEN"]
+
+# =============================================================================
+# v3.6.0: crawl_attempts — Schwellwert für Deaktivierung toter Rules
+# =============================================================================
+
+MAX_FAILED_ATTEMPTS = 5
 
 # =============================================================================
 # CRAWLING CONFIG
@@ -322,7 +335,7 @@ async def fetch_robots_sitemaps(base_url: str) -> List[str]:
     sitemaps: List[str] = []
     try:
         client = await get_http_client()
-        r = await client.get(robots_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.5)"})
+        r = await client.get(robots_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.6)"})
         if r.status_code != 200:
             return []
         for line in r.text.splitlines():
@@ -342,7 +355,7 @@ async def _parse_sitemap_url(client, sitemap_url: str) -> List[str]:
     """Parst eine einzelne Sitemap-URL (inkl. Sitemap-Index, max 5 Sub-Sitemaps)."""
     urls: List[str] = []
     try:
-        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.5)"})
+        r = await client.get(sitemap_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.6)"})
         if r.status_code != 200:
             return []
         root = ET.fromstring(r.text)
@@ -356,7 +369,7 @@ async def _parse_sitemap_url(client, sitemap_url: str) -> List[str]:
                     continue
                 sub_url = sitemap_loc.text.strip()
                 try:
-                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.5)"})
+                    sub_r = await client.get(sub_url, headers={"User-Agent": "Mozilla/5.0 (compatible; VisaScraper/3.6)"})
                     if sub_r.status_code == 200:
                         sub_root = ET.fromstring(sub_r.text)
                         sub_ns = ""
@@ -810,6 +823,63 @@ def update_last_crawled(rule_id: str):
 
 
 # =============================================================================
+# v3.6.0: CRAWL-ATTEMPTS TRACKING
+# Rules die dauerhaft 0 Sub-Links liefern (Login-Wall, Site offline, tot) bekamen
+# nie einen Timestamp und wurden bei jedem Lauf erneut versucht (Dauerschleife).
+# increment_crawl_attempts() zählt Fehlversuche; nach MAX_FAILED_ATTEMPTS wird die
+# Rule deaktiviert (active=false). reset_crawl_attempts() setzt bei Erfolg zurück.
+# =============================================================================
+
+def increment_crawl_attempts(rule_id: str):
+    """
+    Zählt Fehlversuche hoch. Nach MAX_FAILED_ATTEMPTS wird die Rule deaktiviert.
+    Wird nur aufgerufen wenn saved_count = 0.
+    """
+    try:
+        result = (
+            supabase.table("config_rules")
+            .select("crawl_attempts")
+            .eq("rule_id", rule_id)
+            .single()
+            .execute()
+        )
+        current = (result.data.get("crawl_attempts", 0) or 0) if result.data else 0
+        new_count = current + 1
+
+        update_data = {
+            "crawl_attempts": new_count,
+            "last_crawl_failed_at": "now()",
+        }
+
+        if new_count >= MAX_FAILED_ATTEMPTS:
+            update_data["active"] = False
+            logger.warning(
+                f"⛔ Rule {rule_id} nach {MAX_FAILED_ATTEMPTS} Fehlversuchen "
+                f"deaktiviert (active = false)"
+            )
+
+        supabase.table("config_rules").update(update_data).eq("rule_id", rule_id).execute()
+        logger.info(f"📊 crawl_attempts für {rule_id}: {new_count}/{MAX_FAILED_ATTEMPTS}")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not increment crawl_attempts: {str(e)}")
+
+
+def reset_crawl_attempts(rule_id: str):
+    """
+    Setzt Fehlversuche zurück wenn eine Rule erfolgreich gecrawlt wurde.
+    Falls eine Site temporär down war und später wieder erreichbar ist, wird sie
+    nicht dauerhaft deaktiviert.
+    """
+    try:
+        supabase.table("config_rules").update({
+            "crawl_attempts": 0,
+            "last_crawl_failed_at": None,
+        }).eq("rule_id", rule_id).execute()
+    except Exception as e:
+        logger.warning(f"⚠️ Could not reset crawl_attempts: {str(e)}")
+
+
+# =============================================================================
 # v3.0.0: HINTERGRUND-JOB FUNKTION
 # =============================================================================
 
@@ -834,9 +904,11 @@ async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: O
 
                 if saved_count > 0:
                     update_last_crawled(rule['rule_id'])
-                    logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} Sub-Links — last_crawled_at gesetzt")
+                    reset_crawl_attempts(rule['rule_id'])
+                    logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} Sub-Links — last_crawled_at gesetzt, crawl_attempts reset")
                 else:
-                    logger.info(f"⚠️ [{job_id}] Rule {rule['rule_id']}: 0 Sub-Links — last_crawled_at NICHT gesetzt, wird erneut versucht")
+                    increment_crawl_attempts(rule['rule_id'])
+                    logger.info(f"⚠️ [{job_id}] Rule {rule['rule_id']}: 0 Sub-Links — crawl_attempts erhöht")
 
                 job["processed_rules"] += 1
                 job["successful_rules"] += 1
@@ -931,16 +1003,12 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "status": "running",
-        "changes_v3.5.0": [
-            "IGNORED_QUERY_PARAMS: page/p/lang/language/locale entfernt (Pagination + Sprachen erhalten)",
-            "normalize_url: Scheme + Host lowercased (keine Case-Duplikate)",
-            "Per-Domain Rate-Limiting mit Random-Delay + Retry-After-Auswertung",
-            "Content-Type- und Größen-Check in fetch_html_fast (max 5 MB, nur HTML)",
-            "Playwright Race-Condition-Lock + page.close() in finally",
-            "Gechunkte URLs werden vor dem Crawl gefiltert",
-            "robots.txt nur als Sitemap-Quelle genutzt (Disallow nicht als Sperre)",
+        "changes_v3.6.0": [
+            "crawl_attempts Fix: tote Rules werden nach MAX_FAILED_ATTEMPTS=5 deaktiviert",
+            "reset_crawl_attempts bei Erfolg — temporär tote Sites werden nicht dauerhaft entfernt",
+            "Zwei neue Spalten in config_rules: crawl_attempts, last_crawl_failed_at",
         ]
     }
 
@@ -950,7 +1018,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -959,7 +1027,7 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.5.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.6.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
@@ -1117,7 +1185,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.5.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.6.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
@@ -1126,6 +1194,7 @@ async def startup_event():
     logger.info(f"⚡ Max Content: {MAX_CONTENT_BYTES // (1024*1024)} MB, nur HTML")
     logger.info(f"⚡ robots.txt: nur Sitemap-Discovery (Disallow ignoriert)")
     logger.info(f"⚡ Chunked-Vorfilter: aktiv")
+    logger.info(f"⚡ crawl_attempts: Deaktivierung nach {MAX_FAILED_ATTEMPTS} Fehlversuchen")
     logger.info("✅ API is ready!")
 
 

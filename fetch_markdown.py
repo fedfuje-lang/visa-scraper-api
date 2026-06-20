@@ -3,6 +3,17 @@ Fetch Markdown API - Jina Replacement
 FastAPI Endpoint deployed on Railway.app
 Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
+v2.6.0 - Drei Performance-/Resilienz-Fixes (zähe Zone + RAM-Sicherheit):
+  1. Per-URL-Timeout: asyncio.wait_for(fetch_and_convert(url), timeout=60) im
+     Batch-Handler. Eine zähe URL belegt damit höchstens 60s einen
+     Semaphore-Platz statt ~130-165s (httpx-Retries + HEAD + Playwright).
+     Hebt den Durchsatz in den langsamen Ländern.
+  2. fetch_html_playwright cancel-sicher: browser.close() ins finally. Bricht
+     der Per-URL-Timeout die Coroutine mitten im goto() ab, wird der Browser
+     trotzdem geschlossen — kein Chromium-Leak, kein OOM über die Hintertür.
+  3. MAX_RETRIES 3 -> 1: eine tote/lahme Seite wird beim Wiederholen nicht
+     schnell; die 3 Versuche x 25s addierten nur Wartezeit pro kaputter URL.
+
 v2.5.1 - Drei Robustheits-Fixes:
   1. Markdown-Tabellen-Erkennung via Regex (\\|\\s*-{3,}) statt exaktem "| ---"
      — im Tabellen-Wächter UND im Quality Score. Trafilatura gibt Separatoren
@@ -56,8 +67,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-MAX_RETRIES = 3
+# v2.6.0: 3 -> 1. Eine tote/lahme Seite wird beim Wiederholen nicht schnell.
+MAX_RETRIES = 1
 RETRY_DELAYS = [1, 3, 5]
+
+# v2.6.0: Hartes Per-URL-Limit im Batch-Handler (Sekunden).
+PER_URL_TIMEOUT = 60
 
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -363,6 +378,10 @@ async def fetch_html_fast(url: str) -> Optional[str]:
 
 
 async def fetch_html_playwright(url: str) -> Optional[str]:
+    # v2.6.0: browser vor try deklariert + close() im finally.
+    # Bricht der Per-URL-Timeout (asyncio.wait_for) die Coroutine mitten im
+    # goto() ab, wird der Browser trotzdem geschlossen — kein Chromium-Leak.
+    browser = None
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -390,13 +409,17 @@ async def fetch_html_playwright(url: str) -> Optional[str]:
             await page.goto(url, timeout=30000, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
             html = await page.content()
-            await browser.close()
-
             return html
 
     except Exception as e:
         logger.error(f"❌ Playwright Fehler für {url}: {str(e)}")
         return None
+    finally:
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def needs_javascript(html: str) -> bool:
@@ -858,6 +881,8 @@ class BatchRequest(BaseModel):
 async def fetch_markdown_batch(request: BatchRequest):
     """
     BATCH ENDPOINT – bis zu 20 URLs parallel
+    v2.6.0: Per-URL-Timeout (60s) via asyncio.wait_for, cancel-sicherer
+            Playwright-Browser (finally), MAX_RETRIES 3->1
     v2.5.1: Batch Limit 15 → 20 (passend zu WF2 limit=20), Tabellen-Zählung
             via Regex, PDF-Bild-Blöcke gefiltert
     v2.5.0: Tabellen-Wächter, PDF-Tabellenextraktion, robuster Tabellen-Konverter
@@ -877,7 +902,20 @@ async def fetch_markdown_batch(request: BatchRequest):
 
     async def fetch_with_limit(url: str) -> dict:
         async with semaphore:
-            return await fetch_and_convert(url)
+            # v2.6.0: Hartes Per-URL-Limit. Eine zähe URL belegt höchstens
+            # PER_URL_TIMEOUT Sekunden einen Semaphore-Platz statt ~130-165s.
+            try:
+                return await asyncio.wait_for(
+                    fetch_and_convert(url), timeout=PER_URL_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"⏱️ Per-URL-Timeout (>{PER_URL_TIMEOUT}s) für {url}")
+                return {
+                    "data": clean_text(f"[Timeout >{PER_URL_TIMEOUT}s]\nURL: {url}"),
+                    "url": url, "content_type": "error", "quality_score": 0,
+                    "quality_details": {"quality_status": "timeout", "word_count": 0},
+                    "success": False, "error": "per-url timeout"
+                }
 
     raw_results = await asyncio.gather(
         *[fetch_with_limit(url) for url in urls],

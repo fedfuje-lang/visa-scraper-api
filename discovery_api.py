@@ -46,6 +46,19 @@ v3.6.0 - crawl_attempts Fix: Rules die dauerhaft 0 URLs liefern werden nach
          Behebt das Dauerschleifenproblem: tote Rules (Login-Wall, Site offline,
          dauerhaft 0 Sub-Links) bekamen nie einen Timestamp und wurden bei jedem
          Lauf erneut versucht.
+v3.6.1 - Zwei Fixes (Speed + Vollständigkeit), kein Eingriff in Rate-Limits/
+         Concurrency/Retry-Logik:
+         1. Perf: BeautifulSoup-Parsing (needs_javascript, Link-/Title-
+            Extraktion) läuft jetzt über asyncio.to_thread() statt direkt
+            im Event-Loop. Reine Ausführungsverlagerung, keine Verhaltens-
+            änderung — vorher blockierte ein einzelner Parse-Vorgang kurz
+            alle anderen parallelen Tasks im selben Batch.
+         2. Fix: PDFs, die per Content-Type (nicht per '.pdf' in der URL)
+            erkannt werden — z.B. /download?id=123 — wurden bisher in
+            fetch_html_fast() als "kein HTML" still verworfen und landeten
+            nie in discovered_urls. fetch_html_fast() gibt jetzt (html,
+            is_pdf) zurück; process_page() legt für erkannte PDFs denselben
+            discovered_urls-Eintrag an wie beim '.pdf'-Suffix-Fall.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -471,11 +484,21 @@ async def fetch_html_fast(
     domain_fails: Dict[str, int],
     rate_limiter: "DomainRateLimiter",
     is_target: bool = False,
-) -> Optional[str]:
+) -> tuple:
+    """
+    Gibt (html_or_none, is_pdf) zurueck.
+
+    is_pdf=True heisst: der Server antwortet mit Content-Type application/pdf,
+    obwohl die URL selbst kein '.pdf' im Pfad/Query hatte (z.B. Dokumenten-
+    Downloads ueber IDs wie /download?id=123 — bei Behoerden-Seiten haeufig).
+    Vorher wurde das hier still als "kein HTML" verworfen und die URL landete
+    nie in discovered_urls — der einzige PDF-Pfad war die Substring-Pruefung
+    weiter oben in process_page, die nur bei '.pdf' im URL-String greift.
+    """
     domain = get_domain(url)
     if not is_target and domain_fails.get(domain, 0) >= DOMAIN_FAIL_THRESHOLD:
         logger.info(f"⛔ Domain geblockt, skip: {domain} ({url})")
-        return None
+        return None, False
     client = await get_http_client()
     for attempt in range(MAX_RETRIES):
         # v3.5.0 (5): Höflichkeits-Pause pro Domain vor jedem Request
@@ -485,22 +508,25 @@ async def fetch_html_fast(
             if r.status_code == 200:
                 # v3.5.0 (6): Content-Type prüfen — nur HTML weiterverarbeiten
                 content_type = r.headers.get("content-type", "").lower()
+                if "application/pdf" in content_type:
+                    logger.info(f"📄 PDF per Content-Type erkannt (kein .pdf im Link): {url}")
+                    return None, True
                 if content_type and "html" not in content_type and "xml" not in content_type:
                     logger.info(f"⏭️ Kein HTML ({content_type.split(';')[0]}), skip: {url}")
-                    return None
+                    return None, False
                 # v3.5.0 (6): Größen-Check — Riesencontent nicht in den RAM laden
                 content_length = r.headers.get("content-length")
                 if content_length:
                     try:
                         if int(content_length) > MAX_CONTENT_BYTES:
                             logger.info(f"⏭️ Content zu groß ({content_length} bytes), skip: {url}")
-                            return None
+                            return None, False
                     except ValueError:
                         pass
                 if len(r.content) > MAX_CONTENT_BYTES:
                     logger.info(f"⏭️ Content zu groß ({len(r.content)} bytes), skip: {url}")
-                    return None
-                return r.text
+                    return None, False
+                return r.text, False
             elif r.status_code in (403, 429):
                 # v3.5.0 (5): Bei 429 Retry-After respektieren (gedeckelt)
                 if r.status_code == 429 and attempt < MAX_RETRIES - 1:
@@ -516,7 +542,7 @@ async def fetch_html_fast(
                         logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
                 else:
                     logger.warning(f"⚠️ Target URL geblockt (Status {r.status_code}), kein Domain-Block: {url}")
-                return None
+                return None, False
             elif r.status_code in (503, 502):
                 if attempt < MAX_RETRIES - 1:
                     await asyncio.sleep(RETRY_DELAYS[attempt])
@@ -526,10 +552,10 @@ async def fetch_html_fast(
                         domain_fails[domain] = domain_fails.get(domain, 0) + 1
                         if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
                             logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
-                    return None
+                    return None, False
             else:
                 logger.warning(f"⚠️ httpx Status {r.status_code} für {url}")
-                return None
+                return None, False
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAYS[attempt])
@@ -539,11 +565,11 @@ async def fetch_html_fast(
                     domain_fails[domain] = domain_fails.get(domain, 0) + 1
                     if domain_fails[domain] >= DOMAIN_FAIL_THRESHOLD:
                         logger.warning(f"⛔ Domain geblockt nach {DOMAIN_FAIL_THRESHOLD} Fehlern: {domain}")
-                return None
+                return None, False
         except Exception as e:
             logger.warning(f"⚠️ httpx Fehler für {url}: {str(e)}")
-            return None
-    return None
+            return None, False
+    return None, False
 
 
 async def fetch_html_playwright(url: str, browser) -> Optional[str]:
@@ -576,6 +602,49 @@ def needs_javascript(html: str) -> bool:
     if len(text) < 200 and any(ind in html_lower for ind in spa_indicators):
         return True
     return False
+
+
+def _pdf_stub(url: str, depth: int, rule: Dict) -> Dict:
+    """Baut den discovered_urls-Eintrag für ein erkanntes PDF (kein Fetch/Parse nötig)."""
+    return {
+        "url": url,
+        "page_title": url.split("/")[-1][:500] or "document.pdf",
+        "is_main_url": False,
+        "discovered_depth": depth,
+        "rule_id": rule['rule_id'],
+        "country_code": rule['country_iso'],
+        "country_name": rule['country_name'],
+        "target_group": rule['target_group']
+    }
+
+
+def _extract_internal_links(html: str, url: str, base_domain: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    return [
+        a.get("href", "") for a in soup.select("a[href]")
+        if is_internal(urljoin(url, a.get("href", "")), base_domain)
+    ]
+
+
+def _parse_page(html: str, url: str, base_domain: str, depth: int, max_depth: int) -> tuple:
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    page_title = title_tag.get_text(strip=True) if title_tag else ""
+
+    child_links = []
+    if depth < max_depth:
+        for a_tag in soup.select("a[href]"):
+            href = a_tag.get("href", "").strip()
+            if not href:
+                continue
+            full_url = urljoin(url, href)
+            if not full_url.startswith("http"):
+                continue
+            normalized_full = normalize_url(full_url)
+            if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
+                child_links.append(normalized_full)
+
+    return page_title, child_links
 
 
 # =============================================================================
@@ -639,26 +708,25 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             if is_pdf:
                 if is_target:
                     return url, depth, is_target, None, []
-                return url, depth, is_target, {
-                    "url": url,
-                    "page_title": url.split("/")[-1][:500],
-                    "is_main_url": False,
-                    "discovered_depth": depth,
-                    "rule_id": rule['rule_id'],
-                    "country_code": rule['country_iso'],
-                    "country_name": rule['country_name'],
-                    "target_group": rule['target_group']
-                }, []
+                return url, depth, is_target, _pdf_stub(url, depth, rule), []
 
-            html = await fetch_html_fast(url, domain_fails, rate_limiter, is_target=is_target)
-            needs_pw = html and needs_javascript(html)
+            html, detected_pdf = await fetch_html_fast(url, domain_fails, rate_limiter, is_target=is_target)
+
+            # fix: PDF per Content-Type erkannt, obwohl kein '.pdf' im Link stand
+            # (z.B. /download?id=123). Vorher wurde das hier still verworfen und
+            # die URL landete nie in discovered_urls.
+            if detected_pdf:
+                if is_target:
+                    return url, depth, is_target, None, []
+                return url, depth, is_target, _pdf_stub(url, depth, rule), []
+
+            # perf: needs_javascript() parst mit BeautifulSoup (CPU-lastig) —
+            # in Thread auslagern, damit der Event-Loop während dessen nicht
+            # blockiert und die anderen Tasks im selben Batch weiterlaufen.
+            needs_pw = html and await asyncio.to_thread(needs_javascript, html)
 
             if html and not needs_pw:
-                _soup_check = BeautifulSoup(html, "html.parser")
-                internal_links = [
-                    a.get("href", "") for a in _soup_check.select("a[href]")
-                    if is_internal(urljoin(url, a.get("href", "")), base_domain)
-                ]
+                internal_links = await asyncio.to_thread(_extract_internal_links, html, url, base_domain)
                 if len(internal_links) == 0:
                     needs_pw = True
                     logger.info(f"🔄 0 interne Links, nutze Playwright: {url}")
@@ -678,22 +746,11 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             if not html:
                 return url, depth, is_target, None, []
 
-            soup = BeautifulSoup(html, "html.parser")
-            title_tag = soup.find("title")
-            page_title = title_tag.get_text(strip=True) if title_tag else ""
-
-            child_links = []
-            if depth < max_depth:
-                for a_tag in soup.select("a[href]"):
-                    href = a_tag.get("href", "").strip()
-                    if not href:
-                        continue
-                    full_url = urljoin(url, href)
-                    if not full_url.startswith("http"):
-                        continue
-                    normalized_full = normalize_url(full_url)
-                    if is_internal(normalized_full, base_domain) and not is_blocked_path(normalized_full):
-                        child_links.append(normalized_full)
+            # perf: BeautifulSoup-Parse + Link-Extraktion in Thread auslagern
+            # (gleicher Grund wie oben — CPU-lastig, blockiert sonst den Loop).
+            page_title, child_links = await asyncio.to_thread(
+                _parse_page, html, url, base_domain, depth, max_depth
+            )
 
             if is_target:
                 return url, depth, is_target, None, child_links

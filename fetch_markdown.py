@@ -3,6 +3,35 @@ Fetch Markdown API - Jina Replacement
 FastAPI Endpoint deployed on Railway.app
 Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
+v2.7.0 - Speed (Event-Loop + Playwright) + PDF-Fixes:
+  Speed:
+  1. needs_javascript/html_to_markdown/calculate_quality_score laufen jetzt
+     ueber asyncio.to_thread() statt synchron im Event-Loop. Diese Aufrufe
+     sind CPU-lastig (BeautifulSoup, trafilatura) und blockierten bisher
+     kurz ALLE parallelen Tasks im selben Batch (Uvicorn = 1 Worker = 1
+     Event-Loop). Reine Ausfuehrungsverlagerung, kein Verhaltensunterschied.
+  2. fetch_html_playwright() akzeptiert jetzt einen optionalen, bereits
+     laufenden `browser`. fetch_markdown_batch() startet EINEN Browser pro
+     Batch-Aufruf statt bis zu Semaphore(8)-mal einen eigenen Chromium-
+     Prozess pro JS-Seite. Pro URL weiterhin ein eigener Context. Der
+     Einzel-Endpoint /fetch-markdown ruft ohne `browser`-Param auf und
+     verhaelt sich exakt wie vorher.
+  PDF-Fixes:
+  3. Groessen-Check VOR dem Download: extract_pdf_text() laedt jetzt
+     gestreamt (client.stream statt client.get), prueft Content-Length
+     vorab und bricht bei Ueberschreitung von MAX_PDF_BYTES (25 MB) ab -
+     vorher gab es hier ueberhaupt keinen Groessen-Check, anders als beim
+     HTML-Pfad.
+  4. fitz.open() + Tabellenerkennung pro PDF-Seite (CPU-lastig) laeuft
+     jetzt ueber asyncio.to_thread() - gleicher Grund wie Fix 1.
+  5. pdf_text_to_markdown(): die alte Heading-Regel (jede GROSSGESCHRIEBENE
+     Zeile < 100 Zeichen wird zu "## Heading") erzeugte bei Behoerden-PDFs
+     massenhaft Falsch-Headings aus Formular-Labels und Rechtshinweisen.
+     Da calculate_quality_score() heading_count > 3 belohnt, wurden PDFs
+     voller Boilerplate dadurch systematisch BESSER bewertet als PDFs mit
+     dichtem echtem Flieesstext. Neue Regel (_looks_like_pdf_heading):
+     zusaetzlich keine Satzende-Interpunktion und 1-8 Woerter.
+
 v2.6.0 - Drei Performance-/Resilienz-Fixes (zähe Zone + RAM-Sicherheit):
   1. Per-URL-Timeout: asyncio.wait_for(fetch_and_convert(url), timeout=60) im
      Batch-Handler. Eine zähe URL belegt damit höchstens 60s einen
@@ -73,6 +102,13 @@ RETRY_DELAYS = [1, 3, 5]
 
 # v2.6.0: Hartes Per-URL-Limit im Batch-Handler (Sekunden).
 PER_URL_TIMEOUT = 60
+
+# fix: PDFs hatten bisher KEINEN Größen-Check vor dem Download (anders als
+# der HTML-Pfad, der Content-Length schon vorher prüft). Ein sehr großes
+# PDF (Scan-Bände, Gesetzestexte als Sammelband) konnte damit unkontrolliert
+# Zeit/RAM ziehen, bevor überhaupt entschieden wurde ob sich die Extraktion
+# lohnt. 25 MB deckt reguläre Behörden-PDFs komfortabel ab.
+MAX_PDF_BYTES = 25 * 1024 * 1024
 
 _http_client: Optional[httpx.AsyncClient] = None
 
@@ -263,6 +299,25 @@ def _pdf_page_to_markdown(page, fitz_module) -> str:
     return "\n\n".join(item[1] for item in all_items)
 
 
+def _extract_pdf_text_sync(pdf_bytes: bytes, fitz_module) -> Optional[str]:
+    """Reiner CPU-Teil der PDF-Extraktion — wird über asyncio.to_thread() aufgerufen."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        doc = fitz_module.open(tmp_path)
+        # v2.5.0: pro Seite Tabellen-Erkennung statt nur get_text()
+        text_parts = [_pdf_page_to_markdown(page, fitz_module) for page in doc]
+        doc.close()
+        full_text = "\n\n".join(text_parts).strip()
+        return full_text if len(full_text) >= 50 else None
+    finally:
+        if tmp_path:
+            os.unlink(tmp_path)
+
+
 async def extract_pdf_text(url: str) -> Optional[str]:
     try:
         import fitz
@@ -272,27 +327,70 @@ async def extract_pdf_text(url: str) -> Optional[str]:
 
     try:
         client = await get_http_client()
-        r = await client.get(url)
-        if r.status_code != 200:
-            return None
 
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(r.content)
-            tmp_path = tmp.name
+        # fix: gestreamt laden statt client.get() (laedt sonst den ganzen
+        # Body sofort in den RAM). So kann Content-Length VOR dem Lesen
+        # geprüft werden, und ein zu großes PDF wird abgebrochen statt
+        # komplett heruntergeladen.
+        async with client.stream("GET", url) as r:
+            if r.status_code != 200:
+                return None
 
-        try:
-            doc = fitz.open(tmp_path)
-            # v2.5.0: pro Seite Tabellen-Erkennung statt nur get_text()
-            text_parts = [_pdf_page_to_markdown(page, fitz) for page in doc]
-            doc.close()
-            full_text = "\n\n".join(text_parts).strip()
-            return full_text if len(full_text) >= 50 else None
-        finally:
-            os.unlink(tmp_path)
+            content_length = r.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_PDF_BYTES:
+                        logger.warning(
+                            f"⏭️ PDF zu groß ({content_length} bytes > "
+                            f"{MAX_PDF_BYTES}), skip: {url}"
+                        )
+                        return None
+                except ValueError:
+                    pass
+
+            chunks = []
+            total = 0
+            async for chunk in r.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_PDF_BYTES:
+                    logger.warning(
+                        f"⏭️ PDF-Download abgebrochen bei {total} bytes "
+                        f"(Limit {MAX_PDF_BYTES}, kein Content-Length-Header "
+                        f"vorab): {url}"
+                    )
+                    return None
+                chunks.append(chunk)
+            pdf_bytes = b"".join(chunks)
+
+        # perf: fitz.open() + Tabellenerkennung pro Seite ist CPU-lastig,
+        # gleiches Prinzip wie beim HTML-Parsing — in Thread auslagern.
+        return await asyncio.to_thread(_extract_pdf_text_sync, pdf_bytes, fitz)
 
     except Exception as e:
         logger.error(f"❌ PDF-Extraktion fehlgeschlagen für {url}: {str(e)}")
         return None
+
+
+def _looks_like_pdf_heading(line: str) -> bool:
+    """
+    fix: die alte Regel (line.isupper() and len(line) < 100) machte aus JEDER
+    großgeschriebenen Zeile unter 100 Zeichen eine Überschrift. Bei Behörden-
+    PDFs sind Formular-Labels, Rechtshinweise und Disclaimer-Sätze aber
+    häufig komplett großgeschrieben, ohne echte Überschriften zu sein.
+    calculate_quality_score() belohnt heading_count > 3 mit einem Bonus-
+    punkt — PDFs voller Boilerplate wurden dadurch systematisch besser
+    bewertet als PDFs mit dichtem echtem Fließtext ohne Großschreibung.
+
+    Zusätzliche, konservative Kriterien: keine Satzende-Interpunktion
+    (echte Überschriften sind selten ganze Sätze, Rechtshinweise fast
+    immer) und eine plausible Wortzahl (1–8 Wörter).
+    """
+    if not line.isupper() or len(line) >= 100:
+        return False
+    if line[-1] in ".!?":
+        return False
+    word_count = len(line.split())
+    return 1 <= word_count <= 8
 
 
 def pdf_text_to_markdown(text: str, url: str) -> str:
@@ -304,9 +402,10 @@ def pdf_text_to_markdown(text: str, url: str) -> str:
             md_lines.append("")
         elif line.startswith("|"):
             # v2.5.0: Markdown-Tabellenzeilen aus _pdf_page_to_markdown()
-            # unverändert durchreichen (sonst macht isupper() daraus Headings)
+            # unverändert durchreichen (sonst macht die Heading-Prüfung
+            # daraus Headings)
             md_lines.append(line)
-        elif line.isupper() and len(line) < 100:
+        elif _looks_like_pdf_heading(line):
             md_lines.append(f"\n## {line.title()}\n")
         else:
             md_lines.append(line)
@@ -377,14 +476,31 @@ async def fetch_html_fast(url: str) -> Optional[str]:
     return None
 
 
-async def fetch_html_playwright(url: str) -> Optional[str]:
-    # v2.6.0: browser vor try deklariert + close() im finally.
-    # Bricht der Per-URL-Timeout (asyncio.wait_for) die Coroutine mitten im
-    # goto() ab, wird der Browser trotzdem geschlossen — kein Chromium-Leak.
-    browser = None
+async def fetch_html_playwright(url: str, browser=None) -> Optional[str]:
+    """
+    Rendert eine Seite per Playwright.
+
+    perf: Wenn ein bereits laufender `browser` uebergeben wird (Batch-Modus,
+    siehe fetch_markdown_batch), wird dieser wiederverwendet - kein neuer
+    Chromium-Prozess pro URL mehr (vorher: bis zu Semaphore(8) parallele
+    Browser-Starts im selben Batch, je ~1-3s Overhead + RAM/CPU-Spitze auf
+    dem Hetzner-Server, der sich das mit n8n teilt). Pro URL weiterhin ein
+    eigener Context, damit Cookies/Storage zwischen URLs isoliert bleiben -
+    Playwrights vorgesehenes Muster fuer nebenlaeufige Nutzung eines Browsers.
+
+    Ohne uebergebenen Browser (z.B. der Einzel-Endpoint /fetch-markdown)
+    startet die Funktion wie bisher ihren eigenen kurzlebigen Browser und
+    schliesst ihn danach wieder - unveraendertes Verhalten dort.
+    """
+    owns_browser = browser is None
+    playwright_ctx = None
+    active_browser = browser
+    context = None
+
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
+        if owns_browser:
+            playwright_ctx = await async_playwright().start()
+            active_browser = await playwright_ctx.chromium.launch(
                 headless=True,
                 args=[
                     '--no-sandbox',
@@ -394,32 +510,45 @@ async def fetch_html_playwright(url: str) -> Optional[str]:
                 ]
             )
 
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800},
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9,de;q=0.8"}
-            )
+        context = await active_browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9,de;q=0.8"}
+        )
 
-            await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
-                               lambda route: route.abort())
-            await context.route("**/{analytics,tracking,ads,doubleclick}**",
-                               lambda route: route.abort())
+        await context.route("**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
+                           lambda route: route.abort())
+        await context.route("**/{analytics,tracking,ads,doubleclick}**",
+                           lambda route: route.abort())
 
-            page = await context.new_page()
-            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
-            html = await page.content()
-            return html
+        page = await context.new_page()
+        await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+        html = await page.content()
+        return html
 
     except Exception as e:
         logger.error(f"❌ Playwright Fehler für {url}: {str(e)}")
         return None
     finally:
-        if browser is not None:
+        # v2.6.0: cancel-sicher - auch bei Abbruch durch den Per-URL-Timeout
+        # (asyncio.wait_for) wird hier sauber aufgeraeumt, kein Leak.
+        if context is not None:
             try:
-                await browser.close()
+                await context.close()
             except Exception:
                 pass
+        if owns_browser:
+            if active_browser is not None:
+                try:
+                    await active_browser.close()
+                except Exception:
+                    pass
+            if playwright_ctx is not None:
+                try:
+                    await playwright_ctx.stop()
+                except Exception:
+                    pass
 
 
 def needs_javascript(html: str) -> bool:
@@ -483,7 +612,7 @@ def html_to_markdown_bs4(html: str, url: str = "") -> str:
 # =============================================================================
 # v2.5.0 FIX 1: TRAFILATURA TABELLEN-WÄCHTER
 # Trafilatura-Output wird nur akzeptiert wenn:
-#   a) keine Tabellen verloren gingen (HTML hat <table>, Markdown hat Separator)
+#   a) keine Tabellen verloren gingen (HTML-Tabellen vs. Markdown-Tabellen)
 #   b) die Zahlen-Dichte nicht um mehr als 50% eingebrochen ist
 # Sonst: BS4-Fallback (verlustfrei, aber weniger sauber).
 # v2.5.1: Tabellen-Zählung via _count_md_tables() (Regex) statt "| ---" —
@@ -774,14 +903,20 @@ def calculate_quality_score(markdown: str) -> dict:
 # MAIN FETCH FUNCTION
 # =============================================================================
 
-async def fetch_and_convert(url: str) -> dict:
+async def fetch_and_convert(url: str, browser=None) -> dict:
+    """
+    browser: optionaler, bereits laufender Playwright-Browser (Batch-Modus,
+    siehe fetch_markdown_batch). Wenn None (z.B. Einzel-Endpoint
+    /fetch-markdown), startet fetch_html_playwright() weiterhin seinen
+    eigenen kurzlebigen Browser wie bisher — unveraendertes Verhalten dort.
+    """
     if is_pdf_url(url):
         logger.info(f"📄 PDF erkannt: {url}")
         pdf_text = await extract_pdf_text(url)
 
         if pdf_text:
             markdown = pdf_text_to_markdown(pdf_text, url)
-            quality = calculate_quality_score(markdown)
+            quality = await asyncio.to_thread(calculate_quality_score, markdown)
             return {
                 "data": clean_text(markdown),
                 "url": url, "content_type": "pdf",
@@ -808,7 +943,7 @@ async def fetch_and_convert(url: str) -> dict:
                 pdf_text = await extract_pdf_text(url)
                 if pdf_text:
                     markdown = pdf_text_to_markdown(pdf_text, url)
-                    quality = calculate_quality_score(markdown)
+                    quality = await asyncio.to_thread(calculate_quality_score, markdown)
                     return {
                         "data": clean_text(markdown),
                         "url": url, "content_type": "pdf",
@@ -820,7 +955,7 @@ async def fetch_and_convert(url: str) -> dict:
 
     if html is None:
         logger.info(f"🔄 httpx fehlgeschlagen, versuche Playwright: {url}")
-        html = await fetch_html_playwright(url)
+        html = await fetch_html_playwright(url, browser=browser)
 
     if html is None:
         return {
@@ -830,14 +965,14 @@ async def fetch_and_convert(url: str) -> dict:
             "success": False, "error": "Both httpx and Playwright failed"
         }
 
-    if needs_javascript(html):
+    if await asyncio.to_thread(needs_javascript, html):
         logger.info(f"🔄 JS-Seite erkannt, nutze Playwright: {url}")
-        pw_html = await fetch_html_playwright(url)
+        pw_html = await fetch_html_playwright(url, browser=browser)
         if pw_html:
             html = pw_html
 
-    markdown = html_to_markdown(html, url)
-    quality = calculate_quality_score(markdown)
+    markdown = await asyncio.to_thread(html_to_markdown, html, url)
+    quality = await asyncio.to_thread(calculate_quality_score, markdown)
 
     logger.info(f"✅ Fetched {url} → {quality['word_count']} words, score: {quality['final_score']}/10")
 
@@ -900,13 +1035,28 @@ async def fetch_markdown_batch(request: BatchRequest):
 
     semaphore = asyncio.Semaphore(8)
 
+    # perf: EIN Browser fuer den ganzen Batch statt einem pro JS-Seite.
+    # Vorher konnte fetch_html_playwright() bis zu 8x gleichzeitig einen
+    # eigenen Chromium-Prozess starten (Semaphore(8)) - spuerbarer Overhead
+    # und RAM/CPU-Spitze auf dem Hetzner-Server, der sich das mit n8n teilt.
+    playwright_ctx = await async_playwright().start()
+    shared_browser = await playwright_ctx.chromium.launch(
+        headless=True,
+        args=[
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=VizDisplayCompositor'
+        ]
+    )
+
     async def fetch_with_limit(url: str) -> dict:
         async with semaphore:
             # v2.6.0: Hartes Per-URL-Limit. Eine zähe URL belegt höchstens
             # PER_URL_TIMEOUT Sekunden einen Semaphore-Platz statt ~130-165s.
             try:
                 return await asyncio.wait_for(
-                    fetch_and_convert(url), timeout=PER_URL_TIMEOUT
+                    fetch_and_convert(url, browser=shared_browser), timeout=PER_URL_TIMEOUT
                 )
             except asyncio.TimeoutError:
                 logger.warning(f"⏱️ Per-URL-Timeout (>{PER_URL_TIMEOUT}s) für {url}")
@@ -917,10 +1067,21 @@ async def fetch_markdown_batch(request: BatchRequest):
                     "success": False, "error": "per-url timeout"
                 }
 
-    raw_results = await asyncio.gather(
-        *[fetch_with_limit(url) for url in urls],
-        return_exceptions=True
-    )
+    try:
+        raw_results = await asyncio.gather(
+            *[fetch_with_limit(url) for url in urls],
+            return_exceptions=True
+        )
+    finally:
+        # perf: Browser IMMER schliessen, auch bei Exceptions im gather.
+        try:
+            await shared_browser.close()
+        except Exception:
+            pass
+        try:
+            await playwright_ctx.stop()
+        except Exception:
+            pass
 
     results = []
     for i, result in enumerate(raw_results):

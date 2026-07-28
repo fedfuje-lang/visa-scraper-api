@@ -59,6 +59,12 @@ v3.6.1 - Zwei Fixes (Speed + Vollständigkeit), kein Eingriff in Rate-Limits/
             nie in discovered_urls. fetch_html_fast() gibt jetzt (html,
             is_pdf) zurück; process_page() legt für erkannte PDFs denselben
             discovered_urls-Eintrag an wie beim '.pdf'-Suffix-Fall.
+v3.7.0 - MAX_PARALLEL_RULES 2 → 4: Hetzner-Check (28.07.2026) zeigt reichlich
+         Headroom (5,6GB frei von 7,6GB RAM, Load 0.3 auf 4 Kernen, Swap
+         praktisch ungenutzt). Alter OOM-Kill im dmesg-Log (3,6GB RSS eines
+         einzelnen Discovery-Prozesses) stammt vermutlich von vor dem
+         Playwright-Leak-Fix in v3.5.0 (8) — nicht sicher verifizierbar,
+         da ohne Zeitstempel im Log. Nach Deploy RAM/dmesg beobachten.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -89,7 +95,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.6.0"
+    version="3.7.0"
 )
 
 app.add_middleware(
@@ -134,7 +140,11 @@ MAX_FAILED_ATTEMPTS = 5
 # =============================================================================
 
 CONCURRENT_LIMIT = 5
-MAX_PARALLEL_RULES = 2
+# v3.7.0: 2 → 4 (war ursprünglich an CX33: 4 vCPUs/8GB RAM ausgerichtet, s. v2.7.0).
+# Hetzner-Check 28.07.2026: 5,6GB frei, Load 0.3, Swap ungenutzt — Headroom vorhanden.
+# Alter OOM-Kill im Log vermutlich vor dem Playwright-Leak-Fix (v3.5.0 (8)).
+# Nach Deploy RAM/dmesg beobachten, bevor weiter hochgesetzt wird.
+MAX_PARALLEL_RULES = 4
 MAX_RETRIES = 2
 RETRY_DELAYS = [1, 3]
 DOMAIN_FAIL_THRESHOLD = 3
@@ -1060,8 +1070,13 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "status": "running",
+        "changes_v3.7.0": [
+            "MAX_PARALLEL_RULES 2 → 4 nach Hetzner-Kapazitaetscheck (28.07.2026)",
+            "Headroom bestaetigt: 5,6GB frei, Load 0.3 auf 4 Kernen, Swap ungenutzt",
+            "Alter OOM-Kill im Log vermutlich vor Playwright-Leak-Fix (v3.5.0) — RAM nach Deploy beobachten",
+        ],
         "changes_v3.6.0": [
             "crawl_attempts Fix: tote Rules werden nach MAX_FAILED_ATTEMPTS=5 deaktiviert",
             "reset_crawl_attempts bei Erfolg — temporär tote Sites werden nicht dauerhaft entfernt",
@@ -1075,7 +1090,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -1084,7 +1099,7 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.6.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.7.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
@@ -1242,7 +1257,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.6.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.7.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")

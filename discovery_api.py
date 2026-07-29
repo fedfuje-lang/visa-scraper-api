@@ -65,6 +65,29 @@ v3.7.0 - MAX_PARALLEL_RULES 2 → 4: Hetzner-Check (28.07.2026) zeigt reichlich
          einzelnen Discovery-Prozesses) stammt vermutlich von vor dem
          Playwright-Leak-Fix in v3.5.0 (8) — nicht sicher verifizierbar,
          da ohne Zeitstempel im Log. Nach Deploy RAM/dmesg beobachten.
+v3.8.0 - crawl_attempts False-Positive Fix: bislang zaehlte JEDES "0 neue
+         URLs" als Fehlversuch — auch wenn die Seite einwandfrei geladen
+         hat und schlicht ALLES bereits gechunkt war (chunked_skip-Vorfilter
+         aus v3.5.0 (7) greift dann sofort). Traf am 28.07.2026 184 Rules
+         der am laengsten laufenden, best abgedeckten Laender (DE, US, IT,
+         FR, EE, CA, RU, AU, GB, ES, ...) — teils mit MEHR bereits gechunkten
+         URLs als max_urls erlaubt (z.B. DE-E: 177 gechunkt bei max_urls=80).
+         Diese Rules wurden faelschlich dauerhaft deaktiviert, obwohl die
+         Quelle bestens funktioniert — das Feature zum Aussortieren toter
+         Rules hat die erfolgreichsten Rules gefressen.
+         Fix: discover_urls() liefert jetzt zusaetzlich pages_fetched_ok
+         (Anzahl erfolgreich geladener Seiten, inkl. erkannter PDFs — auch
+         wenn sie 0 NEUE URLs ergeben haben). process_rule() unterscheidet
+         jetzt drei Faelle statt zwei:
+           saved_count > 0                       → Erfolg (wie bisher)
+           saved_count == 0, pages_fetched_ok > 0 → NEU: vollstaendig
+                                                     abgedeckt, last_crawled_at
+                                                     setzen + Attempts reset,
+                                                     KEIN Fehlversuch
+           saved_count == 0, pages_fetched_ok == 0 → echter Fehlschlag
+                                                      (wie bisher)
+         Kein Eingriff in Rate-Limits, Concurrency, chunked_skip-Logik oder
+         MAX_PARALLEL_RULES selbst — reiner Klassifizierungs-Fix.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -95,7 +118,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Visa Scraper Discovery API",
     description="URL Discovery Service for Visa Immigration Data Scraping",
-    version="3.7.0"
+    version="3.8.0"
 )
 
 app.add_middleware(
@@ -661,7 +684,16 @@ def _parse_page(html: str, url: str, base_domain: str, depth: int, max_depth: in
 # MAIN DISCOVERY FUNCTION
 # =============================================================================
 
-async def discover_urls(rule: Dict) -> List[Dict]:
+async def discover_urls(rule: Dict) -> tuple:
+    """
+    Gibt (discovered_urls, pages_fetched_ok) zurueck.
+
+    v3.8.0: pages_fetched_ok zaehlt jede Seite, die erfolgreich beantwortet
+    wurde (HTML geladen ODER als PDF erkannt) — unabhaengig davon, ob sie
+    NEUE (noch nicht gechunkte) URLs enthielt. Der Aufrufer (process_rule)
+    nutzt das, um "0 neue URLs weil alles schon bekannt ist" von einem
+    echten Fehlschlag (Seite nicht erreichbar) zu unterscheiden.
+    """
     start_url    = rule['target_url']
     max_pages    = rule['max_urls']
     max_depth    = rule['max_depth']
@@ -672,6 +704,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
 
     visited = set()
     discovered_urls = []
+    pages_fetched_ok = 0  # v3.8.0
     semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
     playwright_instance = None
     playwright_browser = None
@@ -716,9 +749,11 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             url_lower = url.lower()
             is_pdf = url_lower.endswith(".pdf") or ".pdf?" in url_lower
             if is_pdf:
+                # v3.8.0: PDF per Dateiendung erkannt — Seite gilt als erfolgreich
+                # erreichbar (fetched_ok=True), auch ohne HTTP-Request.
                 if is_target:
-                    return url, depth, is_target, None, []
-                return url, depth, is_target, _pdf_stub(url, depth, rule), []
+                    return url, depth, is_target, None, [], True
+                return url, depth, is_target, _pdf_stub(url, depth, rule), [], True
 
             html, detected_pdf = await fetch_html_fast(url, domain_fails, rate_limiter, is_target=is_target)
 
@@ -726,9 +761,10 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             # (z.B. /download?id=123). Vorher wurde das hier still verworfen und
             # die URL landete nie in discovered_urls.
             if detected_pdf:
+                # v3.8.0: fetched_ok=True — Server hat geantwortet, PDF erkannt.
                 if is_target:
-                    return url, depth, is_target, None, []
-                return url, depth, is_target, _pdf_stub(url, depth, rule), []
+                    return url, depth, is_target, None, [], True
+                return url, depth, is_target, _pdf_stub(url, depth, rule), [], True
 
             # perf: needs_javascript() parst mit BeautifulSoup (CPU-lastig) —
             # in Thread auslagern, damit der Event-Loop während dessen nicht
@@ -754,7 +790,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 html = await fetch_html_playwright(url, playwright_browser)
 
             if not html:
-                return url, depth, is_target, None, []
+                # v3.8.0: fetched_ok=False — echter Fehlschlag (nicht erreichbar,
+                # geblockt, kein verwertbarer Content). Einziger False-Pfad.
+                return url, depth, is_target, None, [], False
 
             # perf: BeautifulSoup-Parse + Link-Extraktion in Thread auslagern
             # (gleicher Grund wie oben — CPU-lastig, blockiert sonst den Loop).
@@ -763,7 +801,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             )
 
             if is_target:
-                return url, depth, is_target, None, child_links
+                return url, depth, is_target, None, child_links, True
 
             result = {
                 "url": url,
@@ -775,7 +813,7 @@ async def discover_urls(rule: Dict) -> List[Dict]:
                 "country_name": rule['country_name'],
                 "target_group": rule['target_group']
             }
-            return url, depth, is_target, result, child_links
+            return url, depth, is_target, result, child_links, True
 
     while to_visit and len(visited) < max_pages:
         batch = []
@@ -802,7 +840,9 @@ async def discover_urls(rule: Dict) -> List[Dict]:
             if isinstance(result, Exception):
                 logger.error(f"⚠️ Batch-Fehler: {str(result)}")
                 continue
-            url, depth, is_target, url_data, child_links = result
+            url, depth, is_target, url_data, child_links, fetched_ok = result
+            if fetched_ok:
+                pages_fetched_ok += 1
             if url_data:
                 discovered_urls.append(url_data)
             for link in child_links:
@@ -817,8 +857,11 @@ async def discover_urls(rule: Dict) -> List[Dict]:
     if playwright_instance:
         await playwright_instance.stop()
 
-    logger.info(f"✅ [{rule['rule_id']}] Discovery complete: {len(discovered_urls)} Sub-Links (visited {len(visited)} pages)")
-    return discovered_urls
+    logger.info(
+        f"✅ [{rule['rule_id']}] Discovery complete: {len(discovered_urls)} Sub-Links "
+        f"(visited {len(visited)} pages, {pages_fetched_ok} erfolgreich geladen)"
+    )
+    return discovered_urls, pages_fetched_ok
 
 
 # =============================================================================
@@ -895,12 +938,16 @@ def update_last_crawled(rule_id: str):
 # nie einen Timestamp und wurden bei jedem Lauf erneut versucht (Dauerschleife).
 # increment_crawl_attempts() zählt Fehlversuche; nach MAX_FAILED_ATTEMPTS wird die
 # Rule deaktiviert (active=false). reset_crawl_attempts() setzt bei Erfolg zurück.
+#
+# v3.8.0: increment_crawl_attempts() wird jetzt NUR noch bei echten Fehlschlägen
+# aufgerufen (pages_fetched_ok == 0 in process_rule) — siehe Docstring-Eintrag
+# v3.8.0 im Header für den Hintergrund (False-Positive bei voll abgedeckten Rules).
 # =============================================================================
 
 def increment_crawl_attempts(rule_id: str):
     """
     Zählt Fehlversuche hoch. Nach MAX_FAILED_ATTEMPTS wird die Rule deaktiviert.
-    Wird nur aufgerufen wenn saved_count = 0.
+    Wird nur aufgerufen wenn saved_count = 0 UND pages_fetched_ok = 0 (v3.8.0).
     """
     try:
         result = (
@@ -933,9 +980,9 @@ def increment_crawl_attempts(rule_id: str):
 
 def reset_crawl_attempts(rule_id: str):
     """
-    Setzt Fehlversuche zurück wenn eine Rule erfolgreich gecrawlt wurde.
-    Falls eine Site temporär down war und später wieder erreichbar ist, wird sie
-    nicht dauerhaft deaktiviert.
+    Setzt Fehlversuche zurück wenn eine Rule erfolgreich gecrawlt wurde (Erfolg
+    ODER vollstaendig abgedeckt, s. v3.8.0). Falls eine Site temporär down war
+    und später wieder erreichbar ist, wird sie nicht dauerhaft deaktiviert.
     """
     try:
         supabase.table("config_rules").update({
@@ -966,16 +1013,28 @@ async def run_discovery_job(job_id: str, rules: List[Dict], max_urls_override: O
                 if max_urls_override:
                     rule['max_urls'] = max_urls_override
 
-                discovered = await discover_urls(rule)
+                # v3.8.0: discover_urls() liefert jetzt zusaetzlich pages_fetched_ok
+                discovered, pages_fetched_ok = await discover_urls(rule)
                 saved_count = save_urls_to_supabase(discovered)
 
                 if saved_count > 0:
                     update_last_crawled(rule['rule_id'])
                     reset_crawl_attempts(rule['rule_id'])
                     logger.info(f"✅ [{job_id}] Rule {rule['rule_id']} fertig: {saved_count} Sub-Links — last_crawled_at gesetzt, crawl_attempts reset")
+                elif pages_fetched_ok > 0:
+                    # v3.8.0: Seite(n) erfolgreich geladen, aber ALLES war bereits
+                    # gechunkt (chunked_skip greift) — kein Fehlschlag, sondern
+                    # vollstaendige Abdeckung. last_crawled_at trotzdem setzen,
+                    # crawl_attempts NICHT hochzaehlen.
+                    update_last_crawled(rule['rule_id'])
+                    reset_crawl_attempts(rule['rule_id'])
+                    logger.info(
+                        f"✅ [{job_id}] Rule {rule['rule_id']}: vollständig abgedeckt "
+                        f"(0 neue URLs, {pages_fetched_ok} Seite(n) erfolgreich geprüft) — kein Fehlversuch"
+                    )
                 else:
                     increment_crawl_attempts(rule['rule_id'])
-                    logger.info(f"⚠️ [{job_id}] Rule {rule['rule_id']}: 0 Sub-Links — crawl_attempts erhöht")
+                    logger.info(f"⚠️ [{job_id}] Rule {rule['rule_id']}: 0 Sub-Links, 0 erfolgreiche Fetches — crawl_attempts erhöht")
 
                 job["processed_rules"] += 1
                 job["successful_rules"] += 1
@@ -1070,8 +1129,13 @@ class DirectDiscoveryResponse(BaseModel):
 async def root():
     return {
         "service": "Visa Scraper Discovery API",
-        "version": "3.7.0",
+        "version": "3.8.0",
         "status": "running",
+        "changes_v3.8.0": [
+            "crawl_attempts False-Positive Fix: 'vollstaendig abgedeckt' (0 neue URLs, aber Seiten erfolgreich geladen) zaehlt nicht mehr als Fehlversuch",
+            "discover_urls() liefert jetzt (discovered_urls, pages_fetched_ok) statt nur einer Liste",
+            "Betraf am 28.07.2026 184 faelschlich deaktivierte Rules der best abgedeckten Laender (DE, US, IT, FR, EE, CA, RU, AU, GB, ES, ...)",
+        ],
         "changes_v3.7.0": [
             "MAX_PARALLEL_RULES 2 → 4 nach Hetzner-Kapazitaetscheck (28.07.2026)",
             "Headroom bestaetigt: 5,6GB frei, Load 0.3 auf 4 Kernen, Swap ungenutzt",
@@ -1090,7 +1154,7 @@ async def health():
     running_jobs = sum(1 for j in JOB_STORE.values() if j["status"] == "running")
     return {
         "status": "healthy",
-        "version": "3.7.0",
+        "version": "3.8.0",
         "supabase_connected": bool(SUPABASE_URL and SUPABASE_KEY),
         "active_jobs": running_jobs,
     }
@@ -1099,7 +1163,7 @@ async def health():
 @app.post("/discover", response_model=DiscoveryJobResponse)
 async def run_discovery(request: DiscoveryRequest):
     logger.info("=" * 80)
-    logger.info(f"🚀 DISCOVERY API v3.7.0 — JOB MODE")
+    logger.info(f"🚀 DISCOVERY API v3.8.0 — JOB MODE")
     logger.info("=" * 80)
 
     try:
@@ -1239,7 +1303,9 @@ async def discover_direct(request: DirectDiscoveryRequest):
                 'country_name': request.country_name,
                 'target_group': request.target_group
             }
-            urls = await discover_urls(rule)
+            # v3.8.0: discover_urls() gibt jetzt ein Tuple zurueck (pages_fetched_ok
+            # wird hier nicht gebraucht, dieser Endpoint trackt keine crawl_attempts)
+            urls, _pages_fetched_ok = await discover_urls(rule)
             discovered_urls.extend(urls)
             logger.info(f"✅ Found {len(urls)} Sub-Links from start URL {i}")
 
@@ -1257,7 +1323,7 @@ async def discover_direct(request: DirectDiscoveryRequest):
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Starting Visa Scraper Discovery API v3.7.0...")
+    logger.info("🚀 Starting Visa Scraper Discovery API v3.8.0...")
     logger.info(f"Supabase URL: {SUPABASE_URL}")
     logger.info(f"⚡ Concurrent limit per rule: {CONCURRENT_LIMIT}")
     logger.info(f"⚡ Max parallel rules: {MAX_PARALLEL_RULES}")
@@ -1266,7 +1332,7 @@ async def startup_event():
     logger.info(f"⚡ Max Content: {MAX_CONTENT_BYTES // (1024*1024)} MB, nur HTML")
     logger.info(f"⚡ robots.txt: nur Sitemap-Discovery (Disallow ignoriert)")
     logger.info(f"⚡ Chunked-Vorfilter: aktiv")
-    logger.info(f"⚡ crawl_attempts: Deaktivierung nach {MAX_FAILED_ATTEMPTS} Fehlversuchen")
+    logger.info(f"⚡ crawl_attempts: Deaktivierung nach {MAX_FAILED_ATTEMPTS} Fehlversuchen (nur bei echten Fehlschlaegen, s. v3.8.0)")
     logger.info("✅ API is ready!")
 
 

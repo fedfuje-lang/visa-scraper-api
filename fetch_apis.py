@@ -13,6 +13,19 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
+v4.1.3 – 2026-10-03
+  FIX E (Drossel-Recovery via Multi-Pass): Die World Bank drosselt pro Lauf einen
+         Block von Ländern (liefert 429/Timeout → bisher null → Land fiel raus,
+         nur ~40-51/126 pro Lauf). NEU: der WB-Fetcher gibt einen echten Fehler
+         (Drossel) jetzt nach oben weiter statt still null; der Endpoint fährt
+         danach bis zu MAX_PASSES Durchläufe — pro weiterem Pass werden NUR die
+         Länder mit WB-Fehler erneut versucht, nach PASS_COOLDOWN_SEC Abkühlpause
+         (in der sich das WB-Drossel-Fenster zurücksetzt). Echte Datenlücken
+         (WB liefert leere Serie, kein Fehler) werden NICHT wiederholt. Damit
+         holt EIN Lauf die gedrosselten Länder nach → Abdeckung bis zur echten
+         WB-Datengrenze. Pro-Call-Retry bewusst NICHT gewählt (würde bei
+         anhaltender Drossel jedes Land ins Pro-Land-Timeout laufen lassen).
+
 v4.1.2 – 2026-10-03
   FIX D (Abdeckung): World-Bank-Fetcher nutzt jetzt mrnev=1 (most recent
          non-empty value) statt mrv=5. mrv=5 gab nur die 5 jüngsten Jahre zurück;
@@ -99,6 +112,11 @@ COUNTRY_TIMEOUT = 90.0
 UPSERT_TIMEOUT = 20.0
 # Max. gleichzeitige Provider-Requests PRO LAND (WB drosselt sonst Bursts).
 MAX_CONCURRENT_FETCHES = 4
+# v4.1.3: Multi-Pass-Recovery gegen WB-Drosselung.
+# Länder mit WB-Fehler (nicht: echte Datenlücke) werden in weiteren Pässen erneut
+# versucht, mit Abkühlpause dazwischen (Drossel-Fenster setzt sich zurück).
+MAX_PASSES = 5
+PASS_COOLDOWN_SEC = 30
 
 # =============================================================================
 # Interne Felder die NICHT in smart_country_data geschrieben werden
@@ -301,7 +319,7 @@ async def fetch_worldbank_value(
     params = {"format": "json", "mrnev": 1, "per_page": 5}  # v4.1.2: letzter vorhandener Wert statt nur 5 jüngste Jahre
 
     try:
-        response = await client.get(url, params=params, timeout=15.0)
+        response = await client.get(url, params=params, timeout=10.0)  # v4.1.3: gedrosselte Calls schneller scheitern lassen
         response.raise_for_status()
         data = response.json()
 
@@ -314,8 +332,11 @@ async def fetch_worldbank_value(
         return None
 
     except Exception as e:
+        # v4.1.3: Fehler (429/Timeout/Drossel) nach oben geben, damit der Multi-Pass
+        # das Land erneut versucht. Eine LEERE Serie (echte Datenlücke) gibt oben
+        # bereits None zurück und wird NICHT als Fehler gewertet → kein Retry.
         logger.warning(f"⚠️ World Bank fetch failed [{series_id}] for {worldbank_id}: {e}")
-        return None
+        raise
 
 
 # =============================================================================
@@ -598,7 +619,7 @@ async def process_country(
 
     if not relevant_rules:
         logger.info(f"⏭️ Keine API-Regeln für {country_code}")
-        return {"country_code": country_code, "success": True, "fields_written": 0}
+        return {"country_code": country_code, "success": True, "fields_written": 0, "had_error": False}
 
     logger.info(
         f"🌍 Verarbeite {country_name} ({country_code}) "
@@ -620,6 +641,10 @@ async def process_country(
 
         tasks = [_bounded_fetch(rule) for rule in relevant_rules]
         raw_values = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # v4.1.3: Drossel-Signal — gab es echte Fetch-Fehler (429/Timeout)?
+    # Nur dann lohnt ein erneuter Pass; leere Daten (None) sind echte Datenlücken.
+    wb_error = any(isinstance(rv, Exception) for rv in raw_values)
 
     # Upsert-Dict aufbauen — nur Felder die in smart_country_data existieren
     upsert_data = {
@@ -685,6 +710,7 @@ async def process_country(
             "success": True,
             "fields_written": 0,
             "fields_skipped": fields_skipped,
+            "had_error": wb_error,
         }
 
     # Interne Felder herausfiltern bevor Upsert nach smart_country_data
@@ -713,6 +739,7 @@ async def process_country(
             "success": True,
             "fields_written": fields_written,
             "fields_skipped": fields_skipped,
+            "had_error": wb_error,
         }
 
     except asyncio.TimeoutError:
@@ -722,6 +749,7 @@ async def process_country(
             "country_name": country_name,
             "success": False,
             "error": "upsert timeout",
+            "had_error": True,
         }
     except Exception as e:
         logger.error(f"❌ Supabase upsert fehlgeschlagen für {country_code}: {e}")
@@ -730,6 +758,7 @@ async def process_country(
             "country_name": country_name,
             "success": False,
             "error": str(e),
+            "had_error": True,
         }
 
 
@@ -823,39 +852,65 @@ async def fetch_apis(request: FetchApisRequest):
         logger.error(f"❌ config_apis Abfrage fehlgeschlagen: {e}")
         return {"success": False, "error": str(e)}
 
-    # Länder verarbeiten
-    # v4.1.1 FIX A: jedes Land unter hartem Zeitbudget — ein hängendes Land
-    # friert nicht mehr den ganzen Lauf ein, sondern wird übersprungen.
-    results = []
-    for country in countries:
+    # Länder verarbeiten — v4.1.3 Multi-Pass gegen WB-Drosselung.
+    # Pass 1 nimmt alle Länder; jeder weitere Pass NUR die mit WB-Fehler
+    # (had_error), nach Abkühlpause (Drossel-Fenster setzt sich zurück).
+    # Echte Datenlücken (WB liefert leere Serie, kein Fehler) werden NICHT
+    # wiederholt. v4.1.1 FIX A (Pro-Land-Timeout) bleibt pro Land aktiv.
+    async def _run_country(country):
         cc = country["country_code"]
         try:
-            result = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 process_country(country, api_rules, exchange_rates),
                 timeout=COUNTRY_TIMEOUT,
             )
         except asyncio.TimeoutError:
             logger.error(f"⏱️ {cc}: {COUNTRY_TIMEOUT}s-Budget überschritten — übersprungen")
-            result = {"country_code": cc, "success": False, "error": "country timeout"}
+            return {"country_code": cc, "success": False, "error": "country timeout", "had_error": True}
         except Exception as e:
             logger.error(f"❌ {cc}: unerwarteter Fehler — {e}")
-            result = {"country_code": cc, "success": False, "error": str(e)}
-        results.append(result)
+            return {"country_code": cc, "success": False, "error": str(e), "had_error": True}
+
+    results_by_cc = {}
+    pending = list(countries)
+
+    for pass_num in range(1, MAX_PASSES + 1):
+        if not pending:
+            break
+        if pass_num > 1:
+            logger.info(
+                f"🔁 Pass {pass_num}/{MAX_PASSES}: {len(pending)} Länder mit WB-Fehler "
+                f"erneut (Cooldown {PASS_COOLDOWN_SEC}s)"
+            )
+            await asyncio.sleep(PASS_COOLDOWN_SEC)
+
+        retry_next = []
+        for country in pending:
+            result = await _run_country(country)
+            results_by_cc[country["country_code"]] = result
+            if result.get("had_error"):
+                retry_next.append(country)
+        pending = retry_next
+
+    results = list(results_by_cc.values())
+    still_throttled = len(pending)  # auch nach allen Pässen noch WB-Fehler
 
     successful   = sum(1 for r in results if r.get("success"))
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.1.2: {successful}/{len(results)} Länder, "
-        f"{total_fields} Felder total → smart_country_data"
+        f"🏁 fetch-apis v4.1.3: {successful}/{len(results)} Länder, "
+        f"{total_fields} Felder total, {still_throttled} nach {MAX_PASSES} Pässen "
+        f"weiter mit WB-Fehler → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.1.2",
+        "version": "4.1.3",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,
         "total_fields_written": total_fields,
+        "still_throttled_after_passes": still_throttled,
         "results": results,
     }

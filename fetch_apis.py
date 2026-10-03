@@ -13,6 +13,14 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
+v4.1.2 – 2026-10-03
+  FIX D (Abdeckung): World-Bank-Fetcher nutzt jetzt mrnev=1 (most recent
+         non-empty value) statt mrv=5. mrv=5 gab nur die 5 jüngsten Jahre zurück;
+         Länder, deren letzter Konsum-Datenpunkt älter ist, lieferten null und
+         fielen raus (nur ~40/126 pro Lauf, deterministisch über mehrere Läufe).
+         mrnev=1 holt den jeweils zuletzt vorhandenen Wert → deutlich mehr Länder.
+         Betrifft alle WB-Felder (grocery/living/insurance/transport/utility).
+
 v4.1.1 – 2026-10-03
   HÄRTUNG (Lauf kann nicht mehr einfrieren):
   FIX A (Pro-Land-Zeitbudget): jede Länder-Verarbeitung läuft unter
@@ -290,7 +298,7 @@ async def fetch_worldbank_value(
     client: httpx.AsyncClient
 ) -> Optional[float]:
     url = f"https://api.worldbank.org/v2/country/{worldbank_id}/indicator/{series_id}"
-    params = {"format": "json", "mrv": 5, "per_page": 5}
+    params = {"format": "json", "mrnev": 1, "per_page": 5}  # v4.1.2: letzter vorhandener Wert statt nur 5 jüngste Jahre
 
     try:
         response = await client.get(url, params=params, timeout=15.0)
@@ -838,13 +846,13 @@ async def fetch_apis(request: FetchApisRequest):
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.1.1: {successful}/{len(results)} Länder, "
+        f"🏁 fetch-apis v4.1.2: {successful}/{len(results)} Länder, "
         f"{total_fields} Felder total → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.1.1",
+        "version": "4.1.2",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

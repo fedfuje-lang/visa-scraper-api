@@ -13,6 +13,15 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
+v4.2.1 – 2026-10-03
+  NEU (Provider worldbank_ratio): liefert das Verhältnis zweier WB-Serien,
+         series_id = "NUM/DENOM" (z.B. "PA.NUS.PRVT.PP/PA.NUS.FCRF"). Nötig fürs
+         Preisniveau = PPP-Faktor (Konsum) ÷ Wechselkurs, weil es den fertigen
+         WB-Preisniveau-Indikator (PA.NUS.PPPC.RF) nicht mehr gibt (archiviert).
+         Kein Schema-Umbau — Zähler/Nenner stecken in series_id. Fehler einer der
+         beiden Serien wird durchgereicht (Multi-Pass-Recovery greift); leere
+         Serie → None (echte Lücke).
+
 v4.2.0 – 2026-10-03
   NEU (Preisniveau-Basis): Transformation `pli_anchor` = value × multiplier_pct
          (OHNE /12). Gedacht für die Weltbank-Serie PA.NUS.PPPC.RF (Preisniveau-
@@ -570,6 +579,20 @@ async def fetch_value_for_rule(
         worldbank_id = country.get("worldbank_id") or country["iso2"]
         return await fetch_worldbank_value(worldbank_id, rule["series_id"], client)
 
+    elif provider == "worldbank_ratio":
+        # v4.2.1: Verhältnis zweier WB-Serien, series_id = "NUM/DENOM".
+        # Für Preisniveau: PA.NUS.PRVT.PP / PA.NUS.FCRF (PPP-Faktor ÷ Wechselkurs).
+        worldbank_id = country.get("worldbank_id") or country["iso2"]
+        parts = [p.strip() for p in str(rule["series_id"]).split("/") if p.strip()]
+        if len(parts) != 2:
+            logger.warning(f"⚠️ worldbank_ratio braucht series_id 'NUM/DENOM', hat '{rule['series_id']}'")
+            return None
+        num = await fetch_worldbank_value(worldbank_id, parts[0], client)
+        den = await fetch_worldbank_value(worldbank_id, parts[1], client)
+        if num is None or den is None or den == 0:
+            return None
+        return num / den
+
     elif provider == "bls":
         if not country.get("bls_available"):
             logger.info(f"⏭️ BLS nicht verfügbar für {country['country_code']}")
@@ -605,7 +628,7 @@ def get_currency_for_rule(rule: dict, country: dict) -> str:
     provider = rule["provider"].lower()
     country_code = country.get("country_code", "")
 
-    if provider in ("bls", "worldbank"):
+    if provider in ("bls", "worldbank", "worldbank_ratio"):
         return "USD"
 
     currency_map = {
@@ -920,14 +943,14 @@ async def fetch_apis(request: FetchApisRequest):
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.2.0: {successful}/{len(results)} Länder, "
+        f"🏁 fetch-apis v4.2.1: {successful}/{len(results)} Länder, "
         f"{total_fields} Felder total, {still_throttled} nach {MAX_PASSES} Pässen "
         f"weiter mit WB-Fehler → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.2.0",
+        "version": "4.2.1",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

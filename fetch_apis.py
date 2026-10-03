@@ -13,6 +13,16 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
+v4.2.0 – 2026-10-03
+  NEU (Preisniveau-Basis): Transformation `pli_anchor` = value × multiplier_pct
+         (OHNE /12). Gedacht für die Weltbank-Serie PA.NUS.PPPC.RF (Preisniveau-
+         Index, Verhältnis PPP-Faktor zu Wechselkurs). Damit lassen sich die
+         Kostenfelder (grocery/living/transport/utility) auf eine Preisniveau-
+         Basis statt Pro-Kopf-Konsum stellen: Kosten = Preisniveau × Anker-Faktor,
+         Anker an echten Warenkörben kalibriert. Gibt die realistische Form über
+         alle Länder (Preis- statt Einkommensgefälle). Reine Engine-Erweiterung —
+         welche Serie/Transformation ein Feld nutzt, steht in config_apis.
+
 v4.1.3 – 2026-10-03
   FIX E (Drossel-Recovery via Multi-Pass): Die World Bank drosselt pro Lauf einen
          Block von Ländern (liefert 429/Timeout → bisher null → Land fiel raus,
@@ -258,10 +268,21 @@ def apply_transformation(
     try:
         t = (transformation or "").strip().lower()
 
+        if t == "pli_anchor":
+            # v4.2.0: Preisniveau-Anker. `value` ist ein Preisniveau-Index
+            # (PA.NUS.PPPC.RF, ~0.2–1.3), KEIN Jahresbetrag → NICHT durch 12 teilen.
+            # Kosten = Preisniveau × Anker-Faktor (an echten Warenkörben kalibriert).
+            # Gibt die richtige Form über Länder (Preis-, nicht Einkommensgefälle).
+            result = value * float(multiplier_pct if multiplier_pct is not None else 1.0)
+            if offset_usd:
+                result += float(offset_usd)
+            return round(result, 2)
+
         if multiplier_pct is not None and t not in (
             "cpi_index_to_usd_convert",
             "kwh_price_multiply_250_plus_30pct_convert_usd",
             "cpi_transport_index_to_usd_convert",
+            "pli_anchor",
         ):
             result = (value / 12) * float(multiplier_pct)
             if offset_usd:
@@ -899,14 +920,14 @@ async def fetch_apis(request: FetchApisRequest):
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.1.3: {successful}/{len(results)} Länder, "
+        f"🏁 fetch-apis v4.2.0: {successful}/{len(results)} Länder, "
         f"{total_fields} Felder total, {still_throttled} nach {MAX_PASSES} Pässen "
         f"weiter mit WB-Fehler → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.1.3",
+        "version": "4.2.0",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

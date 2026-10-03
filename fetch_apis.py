@@ -2,7 +2,7 @@
 fetch_apis.py – Generischer API Fetcher für GROUP B: FINANZEN
 FastAPI Router deployed on Railway.app
 
-Liest Regeln aus config_apis + Länderliste aus config_rules (bewährt)
+Liest Regeln aus config_apis + Länderliste aus smart_country_data
 Schreibt DIREKT in smart_country_data (Single Source of Truth)
 
 Provider-Support:
@@ -12,6 +12,15 @@ Provider-Support:
   - Eurostat    (DE, ES, FR + EU-Länder, kWh-Preis → Utility)
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
+
+v4.1.0 – 2026-10-03
+  ÄNDERUNG (Reichweite): Länderliste kommt jetzt aus smart_country_data
+         (Single Source of Truth, 126 Länder) statt aus config_rules (nur 48).
+         Grund: fetch_all_active erreichte bisher nur die 48 config_rules-Länder;
+         die restlichen ~78 Länder wurden nie verarbeitet, obwohl globale
+         World-Bank-Template-Regeln (country_iso IS NULL) für ALLE Länder gelten.
+         Reiner Quellen-Tausch der Länderschleife — Fetcher, Transformer und
+         Provider-Logik bleiben unverändert.
 
 v4.0.1 – 2026-06-13
   FIX 1 (Daten-Erhalt): Fehlgeschlagene Fetches (None / Exception / fehlgeschlagene
@@ -564,7 +573,7 @@ async def process_country(
     async with httpx.AsyncClient(
         timeout=20.0,
         follow_redirects=True,
-        headers={"User-Agent": "VisaScraper/4.0 fetch-apis"}
+        headers={"User-Agent": "VisaScraper/4.1 fetch-apis"}
     ) as client:
         tasks = [
             fetch_value_for_rule(rule, country, client)
@@ -685,7 +694,7 @@ async def fetch_apis(request: FetchApisRequest):
 
     POST /fetch-apis
     Option A: { "country_codes": ["US", "DE", "AU"] }  → spezifische Länder
-    Option B: { "fetch_all_active": true }              → alle aktiven Länder
+    Option B: { "fetch_all_active": true }              → alle Länder in smart_country_data
     """
 
     if not request.fetch_all_active and not request.country_codes:
@@ -698,26 +707,28 @@ async def fetch_apis(request: FetchApisRequest):
     async with httpx.AsyncClient(timeout=10.0) as fx_client:
         exchange_rates = await fetch_exchange_rates(fx_client)
 
-    # Länder laden
+    # Länder laden — v4.1.0: Quelle = smart_country_data (Single Source of Truth, 126 Länder)
+    # statt config_rules (nur 48). Damit erreicht fetch_all_active ALLE Länder, für die
+    # globale World-Bank-Template-Regeln (country_iso IS NULL) ohnehin gelten.
     try:
-        query = supabase.table("config_rules").select(
-            "rule_id, country_name, country_iso"
-        ).eq("active", True)
+        query = supabase.table("smart_country_data").select(
+            "country_code, country_name"
+        )
 
         if request.country_codes:
-            query = query.in_("country_iso", request.country_codes)
+            query = query.in_("country_code", request.country_codes)
 
-        rules_resp = query.execute()
+        scd_resp = query.execute()
 
-        if not rules_resp.data:
-            return {"success": False, "error": "Keine aktiven Länder gefunden"}
+        if not scd_resp.data:
+            return {"success": False, "error": "Keine Länder in smart_country_data gefunden"}
 
         countries = []
         seen_codes = set()
 
-        for r in rules_resp.data:
-            country_code = r.get("country_iso", "").strip()
-            country_name = r["country_name"]
+        for r in scd_resp.data:
+            country_code = (r.get("country_code") or "").strip()
+            country_name = r.get("country_name") or country_code
 
             if not country_code or country_code in seen_codes:
                 continue
@@ -734,10 +745,7 @@ async def fetch_apis(request: FetchApisRequest):
         if not countries:
             return {"success": False, "error": "Keine Länder nach Filterung übrig"}
 
-        logger.info(
-            f"📋 {len(countries)} Länder: "
-            f"{[c['country_code'] for c in countries]}"
-        )
+        logger.info(f"📋 {len(countries)} Länder aus smart_country_data")
 
     except Exception as e:
         logger.error(f"❌ Länder-Abfrage fehlgeschlagen: {e}")
@@ -770,13 +778,13 @@ async def fetch_apis(request: FetchApisRequest):
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.0.1: {successful}/{len(results)} Länder, "
+        f"🏁 fetch-apis v4.1.0: {successful}/{len(results)} Länder, "
         f"{total_fields} Felder total → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.0.1",
+        "version": "4.1.0",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

@@ -13,6 +13,21 @@ Provider-Support:
   - StatCan     (CA, CPI CSV)
   - ONS         (GB, CPIH JSON)
 
+v4.1.1 – 2026-10-03
+  HÄRTUNG (Lauf kann nicht mehr einfrieren):
+  FIX A (Pro-Land-Zeitbudget): jede Länder-Verarbeitung läuft unter
+         asyncio.wait_for(timeout=COUNTRY_TIMEOUT). Hängt ein Land, wird es
+         übersprungen (success=false, error=timeout) und der Lauf macht mit dem
+         nächsten weiter. Vorher konnte ein einzelner hängender Aufruf den ganzen
+         sequentiellen Lauf einfrieren (Zombie-Execution, Exec 9151).
+  FIX B (Upsert nicht-blockierend): der synchrone Supabase-Upsert lief bisher im
+         Event-Loop und konnte bei einem Netz-Stall unbegrenzt blockieren. Läuft
+         jetzt via asyncio.to_thread + asyncio.wait_for(timeout=UPSERT_TIMEOUT).
+  FIX C (WB-Drosselung): die Provider-Calls pro Land laufen jetzt über eine
+         Semaphore (MAX_CONCURRENT_FETCHES). Die World Bank drosselt Bursts von
+         ~9 gleichzeitigen Requests → vorher viele None-Werte (z.B. KZ: nur
+         transport befüllt, utility/grocery/living leer).
+
 v4.1.0 – 2026-10-03
   ÄNDERUNG (Reichweite): Länderliste kommt jetzt aus smart_country_data
          (Single Source of Truth, 126 Länder) statt aus config_rules (nur 48).
@@ -64,6 +79,18 @@ router = APIRouter()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =============================================================================
+# v4.1.1 HÄRTUNGS-PARAMETER
+# =============================================================================
+
+# Max. Sekunden pro Land (gesamt: alle Provider-Calls + Upsert). Danach wird das
+# Land übersprungen und der Lauf macht weiter → kein Einfrieren mehr.
+COUNTRY_TIMEOUT = 90.0
+# Max. Sekunden für den Supabase-Upsert eines Landes.
+UPSERT_TIMEOUT = 20.0
+# Max. gleichzeitige Provider-Requests PRO LAND (WB drosselt sonst Bursts).
+MAX_CONCURRENT_FETCHES = 4
 
 # =============================================================================
 # Interne Felder die NICHT in smart_country_data geschrieben werden
@@ -570,15 +597,20 @@ async def process_country(
         f"– {len(relevant_rules)} Regeln"
     )
 
+    # v4.1.1 FIX C: Provider-Calls pro Land über eine Semaphore drosseln
+    # (World Bank drosselt Bursts von ~9 gleichzeitigen Requests).
     async with httpx.AsyncClient(
         timeout=20.0,
         follow_redirects=True,
         headers={"User-Agent": "VisaScraper/4.1 fetch-apis"}
     ) as client:
-        tasks = [
-            fetch_value_for_rule(rule, country, client)
-            for rule in relevant_rules
-        ]
+        sem = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
+
+        async def _bounded_fetch(rule):
+            async with sem:
+                return await fetch_value_for_rule(rule, country, client)
+
+        tasks = [_bounded_fetch(rule) for rule in relevant_rules]
         raw_values = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Upsert-Dict aufbauen — nur Felder die in smart_country_data existieren
@@ -651,10 +683,17 @@ async def process_country(
     smart_data = {k: v for k, v in upsert_data.items() if k not in INTERNAL_FIELDS}
 
     try:
-        supabase.table("smart_country_data").upsert(
-            smart_data,
-            on_conflict="country_code"
-        ).execute()
+        # v4.1.1 FIX B: Blockierenden Supabase-Upsert in einen Thread auslagern
+        # und hart timeouten, damit ein Netz-Stall den Event-Loop nicht einfriert.
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: supabase.table("smart_country_data").upsert(
+                    smart_data,
+                    on_conflict="country_code"
+                ).execute()
+            ),
+            timeout=UPSERT_TIMEOUT,
+        )
 
         logger.info(
             f"✅ {country_name}: {fields_written} Felder geschrieben, "
@@ -668,6 +707,14 @@ async def process_country(
             "fields_skipped": fields_skipped,
         }
 
+    except asyncio.TimeoutError:
+        logger.error(f"⏱️ Supabase upsert Timeout ({UPSERT_TIMEOUT}s) für {country_code}")
+        return {
+            "country_code": country_code,
+            "country_name": country_name,
+            "success": False,
+            "error": "upsert timeout",
+        }
     except Exception as e:
         logger.error(f"❌ Supabase upsert fehlgeschlagen für {country_code}: {e}")
         return {
@@ -769,22 +816,35 @@ async def fetch_apis(request: FetchApisRequest):
         return {"success": False, "error": str(e)}
 
     # Länder verarbeiten
+    # v4.1.1 FIX A: jedes Land unter hartem Zeitbudget — ein hängendes Land
+    # friert nicht mehr den ganzen Lauf ein, sondern wird übersprungen.
     results = []
     for country in countries:
-        result = await process_country(country, api_rules, exchange_rates)
+        cc = country["country_code"]
+        try:
+            result = await asyncio.wait_for(
+                process_country(country, api_rules, exchange_rates),
+                timeout=COUNTRY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"⏱️ {cc}: {COUNTRY_TIMEOUT}s-Budget überschritten — übersprungen")
+            result = {"country_code": cc, "success": False, "error": "country timeout"}
+        except Exception as e:
+            logger.error(f"❌ {cc}: unerwarteter Fehler — {e}")
+            result = {"country_code": cc, "success": False, "error": str(e)}
         results.append(result)
 
     successful   = sum(1 for r in results if r.get("success"))
     total_fields = sum(r.get("fields_written", 0) for r in results)
 
     logger.info(
-        f"🏁 fetch-apis v4.1.0: {successful}/{len(results)} Länder, "
+        f"🏁 fetch-apis v4.1.1: {successful}/{len(results)} Länder, "
         f"{total_fields} Felder total → smart_country_data"
     )
 
     return {
         "success": True,
-        "version": "4.1.0",
+        "version": "4.1.1",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,

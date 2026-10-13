@@ -51,13 +51,14 @@ Semaphore; v4.1.0 Länderquelle smart_country_data; v4.0.1 Daten-Erhalt + NOK/DK
 v4.0.0 Direkt-Write smart_country_data.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
 from typing import Optional, List, Any
 import httpx
 import asyncio
 import logging
+import uuid
 import os
 import io
 import csv
@@ -89,6 +90,28 @@ PASS_COOLDOWN_SEC = 30
 # Staging-Ziel
 STAGING_TABLE = "api_values"
 SYNC_FUNCTION = "fl_sync_api_values"
+
+# =============================================================================
+# JOB-SYSTEM (v5.1.0) — /fetch-apis laeuft im Hintergrund, Client pollt Status.
+# Grund: der volle Lauf (126 Laender sequenziell x bis zu 90s + Multi-Pass) kann
+# Stunden dauern; ein synchroner HTTP-Call lief in den n8n-Timeout (ECONNABORTED)
+# und riss frueher die ganze Kette. Jetzt: POST gibt sofort job_id zurueck, der
+# Lauf laeuft serverseitig fertig (inkl. Sync), n8n pollt /fetch-apis/status/{id}.
+# Analog zum bestehenden /discover-Job-Muster.
+# =============================================================================
+
+FETCH_JOBS: dict = {}          # job_id -> job-dict (In-Memory, wie JOB_STORE bei /discover)
+MAX_FETCH_JOBS_KEPT = 50       # alte Jobs begrenzen (In-Memory-Store nicht volllaufen lassen)
+
+
+def _prune_fetch_jobs() -> None:
+    """Behaelt die juengsten MAX_FETCH_JOBS_KEPT Jobs, verwirft aeltere."""
+    if len(FETCH_JOBS) <= MAX_FETCH_JOBS_KEPT:
+        return
+    ordered = sorted(FETCH_JOBS.items(),
+                     key=lambda kv: kv[1].get("started_at", ""), reverse=True)
+    for jid, _ in ordered[MAX_FETCH_JOBS_KEPT:]:
+        FETCH_JOBS.pop(jid, None)
 
 INTERNAL_FIELDS = {
     'rule_id', 'source_url', 'url_id', 'extraction_quality',
@@ -828,8 +851,7 @@ class FetchApisRequest(BaseModel):
     sync_after: Optional[bool] = True   # nach dem Lauf fl_sync_api_values() aufrufen
 
 
-@router.post("/fetch-apis")
-async def fetch_apis(request: FetchApisRequest):
+async def _fetch_apis_core(request: FetchApisRequest) -> dict:
     """
     Holt API-Daten laut config_apis und schreibt sie in die Staging-Tabelle
     api_values. Danach (sync_after=true) wird fl_sync_api_values() aufgerufen,
@@ -938,7 +960,7 @@ async def fetch_apis(request: FetchApisRequest):
 
     return {
         "success": True,
-        "version": "5.0.0",
+        "version": "5.1.0",
         "total_countries": len(results),
         "successful": successful,
         "failed": len(results) - successful,
@@ -947,3 +969,75 @@ async def fetch_apis(request: FetchApisRequest):
         "synced": sync_result,
         "results": results,
     }
+
+
+# =============================================================================
+# JOB-WRAPPER + ENDPUNKTE (v5.1.0)
+# =============================================================================
+
+class FetchApisJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+async def _run_fetch_apis_job(job_id: str, request: FetchApisRequest) -> None:
+    """Hintergrund-Task: fuehrt _fetch_apis_core aus und legt Ergebnis/Fehler im
+    Job-Store ab. Faengt ALLES ab, damit ein Job nie ewig auf 'running' haengt."""
+    job = FETCH_JOBS[job_id]
+    job["status"] = "running"
+    try:
+        result = await _fetch_apis_core(request)
+        job["result"] = result
+        # Kern liefert bei fehlender Eingabe/DB-Problem {"success": False,...};
+        # das ist KEIN 'failed'-Job, nur ein Ergebnis mit success=false.
+        job["status"] = "completed"
+        job["successful"] = result.get("successful", 0)
+        job["failed"] = result.get("failed", 0)
+        job["total_fields_staged"] = result.get("total_fields_staged", 0)
+    except Exception as e:  # unerwartet (der Kern ist pro Land/Regel bereits isoliert)
+        logger.error(f"❌ [{job_id}] fetch-apis Job abgebrochen: {e}")
+        job["status"] = "failed"
+        job["error"] = str(e)
+    finally:
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@router.post("/fetch-apis", response_model=FetchApisJobResponse)
+async def start_fetch_apis(request: FetchApisRequest):
+    """Startet den Fetch-Lauf im Hintergrund und gibt sofort eine job_id zurueck.
+    Status/Ergebnis via GET /fetch-apis/status/{job_id}. (v5.1.0, analog /discover.)
+
+    POST /fetch-apis
+      { "fetch_all_active": true }                alle Laender
+      { "country_codes": ["US","DE"] }            spezifische Laender
+      { "fetch_all_active": true, "sync_after": false }   nur stagen
+    """
+    if not request.fetch_all_active and not request.country_codes:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'country_codes' or 'fetch_all_active': true",
+        )
+    job_id = str(uuid.uuid4())
+    FETCH_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "successful": 0,
+        "failed": 0,
+        "total_fields_staged": 0,
+        "result": None,
+        "error": None,
+    }
+    _prune_fetch_jobs()
+    asyncio.create_task(_run_fetch_apis_job(job_id, request))
+    logger.info(f"✅ fetch-apis Job {job_id} gestartet (fetch_all_active={request.fetch_all_active})")
+    return FetchApisJobResponse(job_id=job_id, status="queued")
+
+
+@router.get("/fetch-apis/status/{job_id}")
+async def fetch_apis_status(job_id: str):
+    """Pollt den Status eines Fetch-Jobs. status in: queued|running|completed|failed."""
+    if job_id not in FETCH_JOBS:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} nicht gefunden")
+    return FETCH_JOBS[job_id]

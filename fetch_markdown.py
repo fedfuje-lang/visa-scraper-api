@@ -3,6 +3,14 @@ Fetch Markdown API - Jina Replacement
 FastAPI Endpoint deployed on Railway.app
 Converts URLs to clean Markdown for n8n WF2 (Content Extraction)
 
+v2.7.1 - Box-Entlastung: Chromium-Parallelität pro Batch von fest 8 auf
+  Env-Var BATCH_CONCURRENCY (Default 3) gesenkt. 8 parallele Playwright-
+  Kontexte (~150 MB/Stück) rissen auf der geteilten Hetzner-Box RAM-Spitzen,
+  die den Fetch unter Dauerlast kippen ließen (api_error eskalierte über die
+  Laufzeit bis zum WF2-/Orchestrator-Crash). 3 reicht, da httpx der Hauptpfad
+  ist und Chromium nur Fallback. Ohne Redeploy nachjustierbar via
+  FETCH_BATCH_CONCURRENCY. Kombiniert mit WF2 Batch 20→10.
+
 v2.7.0 - Speed (Event-Loop + Playwright) + PDF-Fixes:
   Speed:
   1. needs_javascript/html_to_markdown/calculate_quality_score laufen jetzt
@@ -102,6 +110,14 @@ RETRY_DELAYS = [1, 3, 5]
 
 # v2.6.0: Hartes Per-URL-Limit im Batch-Handler (Sekunden).
 PER_URL_TIMEOUT = 60
+
+# v2.7.0: Chromium-Parallelität pro Batch als Env-Var (Default 3 statt 8).
+# Jeder parallele Playwright-Kontext kostet ~150 MB; 8 gleichzeitig rissen auf
+# der geteilten Hetzner-Box (n8n + visa-api) RAM-Spitzen, die den Fetch unter
+# Dauerlast kippen ließen (api_error eskalierte über die Laufzeit bis zum Crash).
+# 3 reicht, da die meisten URLs über httpx laufen und Chromium nur Fallback ist.
+# Ohne Redeploy nachjustierbar via Env-Var FETCH_BATCH_CONCURRENCY.
+BATCH_CONCURRENCY = int(os.getenv("FETCH_BATCH_CONCURRENCY", "3"))
 
 # fix: PDFs hatten bisher KEINEN Größen-Check vor dem Download (anders als
 # der HTML-Pfad, der Content-Length schon vorher prüft). Ein sehr großes
@@ -1029,11 +1045,11 @@ async def fetch_markdown_batch(request: BatchRequest):
         raise HTTPException(status_code=400, detail="urls list is required")
 
     # v2.5.1: 15 → 20, passend zu WF2 "Get Pending URLs" (limit=20).
-    # Semaphore(8) begrenzt weiterhin die echte Parallelität.
+    # Semaphore(BATCH_CONCURRENCY, Default 3) begrenzt die echte Parallelität.
     urls = request.urls[:20]
     logger.info(f"🚀 Batch fetch started: {len(urls)} URLs")
 
-    semaphore = asyncio.Semaphore(8)
+    semaphore = asyncio.Semaphore(BATCH_CONCURRENCY)
 
     # perf: EIN Browser fuer den ganzen Batch statt einem pro JS-Seite.
     # Vorher konnte fetch_html_playwright() bis zu 8x gleichzeitig einen
